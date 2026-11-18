@@ -1,0 +1,5 @@
+node_modules
+vscode
+converted-glb
+.aider*
+conversion_report.txt
