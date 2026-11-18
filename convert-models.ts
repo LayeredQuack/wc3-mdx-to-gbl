@@ -4,6 +4,12 @@ import { parseMDX, decodeBLP, getBLPImageData } from 'war3-model';
 import { PNG } from 'pngjs';
 import { Document, NodeIO, Primitive } from '@gltf-transform/core';
 
+/**
+ * Stage 3 texture pass: path-aware BLP resolution, all MDX UV sets, material
+ * CoordId selection, and ordered material-layer geometry passes. Warcraft blend
+ * modes without a direct glTF equivalent are reported as approximations.
+ */
+
 interface ConversionRecord {
   filePath: string;
   bytes: number;
@@ -62,95 +68,264 @@ class ModelConversionReporter {
 
 // ── Texture Indexing & Resolution ──────────────────────────────────────────
 interface TextureIndex {
+  root: string;
   fullRel: Map<string, string>;
   byBase: Map<string, string[]>;
-  byTop: Map<string, Map<string, string>>;
+  bySuffix: Map<string, string[]>;
+}
+
+function normalizeAssetPath(value: string): string {
+  const slashed = value.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+  return path.posix.normalize(slashed).replace(/^\.\//, '').toLowerCase();
 }
 
 function buildTextureIndex(root: string): TextureIndex {
   const fullRel = new Map<string, string>();
   const byBase = new Map<string, string[]>();
-  const byTop = new Map<string, Map<string, string>>();
+  const bySuffix = new Map<string, string[]>();
 
-  function walk(dir: string) {
+  function addToIndex(map: Map<string, string[]>, key: string, fullPath: string): void {
+    const entries = map.get(key) || [];
+    entries.push(fullPath);
+    map.set(key, entries);
+  }
+
+  function walk(dir: string): void {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
       return;
     }
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
+
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
         walk(full);
         continue;
       }
-      if (!e.name.toLowerCase().endsWith('.blp')) continue;
+      if (!entry.name.toLowerCase().endsWith('.blp')) continue;
 
-      const rel = path.relative(root, full).split(path.sep).join('/');
-      const base = e.name.toLowerCase();
-      const top = rel.split('/')[0].toLowerCase();
+      const rel = normalizeAssetPath(path.relative(root, full));
+      fullRel.set(rel, full);
+      addToIndex(byBase, path.posix.basename(rel), full);
 
-      fullRel.set(rel.toLowerCase(), full);
-
-      if (!byBase.has(base)) byBase.set(base, []);
-      byBase.get(base)!.push(full);
-
-      if (!byTop.has(top)) byTop.set(top, new Map());
-      const tm = byTop.get(top)!;
-      tm.set(base, full);
-      tm.set(base.replace(/\.blp$/i, ''), full);
+      // Index every path suffix (e.g. "Textures/orc.blp" and "orc.blp").
+      // This lets MDX texture references match archive paths without falling
+      // immediately back to an arbitrary same-basename texture.
+      const parts = rel.split('/');
+      for (let i = 0; i < parts.length; i++) {
+        addToIndex(bySuffix, parts.slice(i).join('/'), full);
+      }
     }
   }
+
   walk(root);
-  return { fullRel, byBase, byTop };
+  return { root, fullRel, byBase, bySuffix };
 }
 
-function rankTexturePath(absPath: string): number {
-  const lower = absPath.replace(/\\/g, '/').toLowerCase();
-  if (lower.includes('/war3patch')) return 0;
-  if (lower.includes('/war3x')) return 1;
-  if (lower.includes('/war3_') || lower.includes('/war3/')) return 2;
+function rankTexturePath(assetPath: string): number {
+  const lower = assetPath.replace(/\\/g, '/').toLowerCase();
+  if (lower.includes('/war3patch') || lower.startsWith('war3patch')) return 0;
+  if (lower.includes('/war3x') || lower.startsWith('war3x')) return 1;
+  if (lower.includes('/war3_') || lower.includes('/war3/') || lower.startsWith('war3_')) return 2;
   return 10;
 }
 
-function pickBest(paths: string[]): string {
-  return paths.slice().sort((a, b) => rankTexturePath(a) - rankTexturePath(b))[0];
+function commonPathPrefixLength(a: string, b: string): number {
+  const aa = normalizeAssetPath(a).split('/').filter(Boolean);
+  const bb = normalizeAssetPath(b).split('/').filter(Boolean);
+  let count = 0;
+  while (count < aa.length && count < bb.length && aa[count] === bb[count]) count++;
+  return count;
 }
 
-function resolveTexture(texPath: string | undefined, index: TextureIndex, mdxRelPath?: string): string | null {
-  if (!texPath || !texPath.trim()) return null;
-  const normalized = texPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  const lower = normalized.toLowerCase();
-  const base = path.basename(lower);
-  const baseNoExt = base.replace(/\.blp$/i, '');
+function chooseTextureCandidate(
+  candidates: string[],
+  index: TextureIndex,
+  mdxRelPath: string | undefined,
+  requestedPath: string,
+  warn: (message: string) => void
+): string | null {
+  if (candidates.length === 0) return null;
 
-  if (index.fullRel.has(lower)) return index.fullRel.get(lower)!;
+  const modelRel = normalizeAssetPath(mdxRelPath || '');
+  const modelParts = modelRel.split('/').filter(Boolean);
+  const modelTop = modelParts[0] || '';
+  const modelDir = path.posix.dirname(modelRel);
 
-  if (mdxRelPath) {
-    const top = mdxRelPath.split('/')[0].toLowerCase();
-    const topMap = index.byTop.get(top);
-    if (topMap) {
-      if (topMap.has(base)) return topMap.get(base)!;
-      if (topMap.has(baseNoExt)) return topMap.get(baseNoExt)!;
-      const underTop = `${top}/${lower}`;
-      if (index.fullRel.has(underTop)) return index.fullRel.get(underTop)!;
+  const ranked = candidates.map((abs) => {
+    const rel = normalizeAssetPath(path.relative(index.root, abs));
+    const sameTop = modelTop !== '' && rel.split('/')[0] === modelTop;
+    const proximity = commonPathPrefixLength(modelDir, path.posix.dirname(rel));
+    return { abs, rel, sameTop, proximity, archiveRank: rankTexturePath(rel) };
+  }).sort((a, b) => {
+    if (a.sameTop !== b.sameTop) return a.sameTop ? -1 : 1;
+    if (a.proximity !== b.proximity) return b.proximity - a.proximity;
+    if (a.archiveRank !== b.archiveRank) return a.archiveRank - b.archiveRank;
+    return a.rel.localeCompare(b.rel);
+  });
+
+  if (ranked.length > 1) {
+    const best = ranked[0];
+    const tied = ranked.filter((candidate) =>
+      candidate.sameTop === best.sameTop &&
+      candidate.proximity === best.proximity &&
+      candidate.archiveRank === best.archiveRank
+    );
+    if (tied.length > 1) {
+      warn(`Ambiguous texture reference "${requestedPath}" matched ${tied.length} files; selected "${best.rel}". Other matches: ${tied.slice(1, 4).map((v) => v.rel).join(', ')}`);
     }
   }
+  return ranked[0].abs;
+}
 
-  const hits = index.byBase.get(base) || [];
-  if (hits.length) return pickBest(hits);
+function resolveTexture(
+  texPath: string | undefined,
+  index: TextureIndex,
+  mdxRelPath?: string,
+  warn: (message: string) => void = (message) => console.warn(`[Texture Warning] ${message}`)
+): string | null {
+  if (!texPath || !texPath.trim()) return null;
+  const lower = normalizeAssetPath(texPath);
+  const lowerWithExtension = /\.blp$/i.test(lower) ? lower : `${lower}.blp`;
+  const base = path.posix.basename(lowerWithExtension);
+  const modelRel = normalizeAssetPath(mdxRelPath || '');
+  const modelDir = path.posix.dirname(modelRel);
+  const modelTop = modelRel.split('/')[0];
+
+  // 1. Exact path relative to the extraction root.
+  const exact = index.fullRel.get(lower) || index.fullRel.get(lowerWithExtension);
+  if (exact) return exact;
+
+  // 2. Resolve relative to the MDX's own directory and top-level archive.
+  if (mdxRelPath) {
+    const besideModel = normalizeAssetPath(path.posix.join(modelDir, lower));
+    const besideHit = index.fullRel.get(besideModel) || index.fullRel.get(`${besideModel}.blp`);
+    if (besideHit) return besideHit;
+
+    const underArchive = normalizeAssetPath(path.posix.join(modelTop, lower));
+    const archiveHit = index.fullRel.get(underArchive) || index.fullRel.get(`${underArchive}.blp`);
+    if (archiveHit) return archiveHit;
+  }
+
+  // 3. Match the complete referenced suffix before considering basename only.
+  const suffixHits = index.bySuffix.get(lower) || index.bySuffix.get(lowerWithExtension) || [];
+  if (suffixHits.length) {
+    return chooseTextureCandidate(suffixHits, index, mdxRelPath, texPath, warn);
+  }
+
+  // 4. Last resort: basename match. Warn whenever the name is not unique.
+  const baseHits = index.byBase.get(base) || [];
+  if (baseHits.length) {
+    if (baseHits.length > 1) {
+      warn(`Texture "${texPath}" had no path match and ${baseHits.length} basename matches; applying archive/model proximity ranking`);
+    }
+    return chooseTextureCandidate(baseHits, index, mdxRelPath, texPath, warn);
+  }
 
   return null;
 }
 
-function blpToPngBuffer(blpPath: string): Buffer {
-  const raw = fs.readFileSync(blpPath);
-  const blp = decodeBLP(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
-  const img = getBLPImageData(blp, 0);
-  const png = new PNG({ width: img.width, height: img.height });
-  for (let i = 0; i < img.data.length; i++) png.data[i] = img.data[i];
-  return PNG.sync.write(png);
+function readStaticNumeric(value: any, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  // A few parser/model variants expose layer properties as AnimVector tracks.
+  // Use the first authored key for the static GLB material and report that the
+  // complete animated property is not yet exported.
+  const firstValue = value?.Keys?.[0]?.Vector?.[0];
+  return typeof firstValue === 'number' && Number.isFinite(firstValue)
+    ? firstValue
+    : fallback;
+}
+
+function createLayerMaterial(
+  doc: Document,
+  materialIndex: number,
+  layerIndex: number,
+  layer: any,
+  textures: any[],
+  textureSlots: (ReturnType<Document['createTexture']> | null)[],
+  warn: (message: string) => void
+): ReturnType<Document['createMaterial']> | null {
+  const textureId = Math.trunc(readStaticNumeric(layer?.TextureID, 0));
+  if (!Number.isInteger(textureId) || textureId < 0 || textureId >= textureSlots.length) {
+    warn(`Material ${materialIndex} layer ${layerIndex}: invalid or animated TextureID (${textureId}); layer omitted`);
+    return null;
+  }
+
+  const texture = textureSlots[textureId];
+  if (!texture) {
+    const sourceTexture = textures[textureId];
+    const replaceableId = Number(sourceTexture?.ReplaceableId ?? 0);
+    if (replaceableId > 0) {
+      warn(`Material ${materialIndex} layer ${layerIndex}: texture slot ${textureId} uses ReplaceableId ${replaceableId}; no team-color/replaceable texture has been substituted`);
+    } else {
+      warn(`Material ${materialIndex} layer ${layerIndex}: texture slot ${textureId} is unresolved; layer omitted`);
+    }
+    return null;
+  }
+
+  const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
+  const filterMode = Math.trunc(readStaticNumeric(layer?.FilterMode, 0));
+  const alpha = Math.max(0, Math.min(1, readStaticNumeric(layer?.Alpha, 1)));
+  const shading = Math.trunc(readStaticNumeric(layer?.Shading, 0));
+  const material = doc.createMaterial(`mat_${materialIndex}_layer_${layerIndex}`)
+    .setMetallicFactor(0)
+    .setRoughnessFactor(1)
+    .setBaseColorFactor([1, 1, 1, alpha]);
+
+  material.setBaseColorTexture(texture);
+  const textureInfo = material.getBaseColorTextureInfo();
+  if (textureInfo) {
+    textureInfo.setTexCoord(coordId);
+    const flags = Number(textures[textureId]?.Flags ?? 0);
+    // MDX TextureFlags: WrapWidth=1, WrapHeight=2. glTF texture wrap enums:
+    // REPEAT=10497, CLAMP_TO_EDGE=33071.
+    textureInfo.setWrapS((flags & 1) !== 0 ? 10497 : 33071);
+    textureInfo.setWrapT((flags & 2) !== 0 ? 10497 : 33071);
+  }
+
+  if (filterMode === 1) {
+    material.setAlphaMode('MASK').setAlphaCutoff(0.75);
+  } else if (filterMode >= 2) {
+    material.setAlphaMode('BLEND');
+    if (filterMode >= 3) {
+      warn(`Material ${materialIndex} layer ${layerIndex}: Warcraft filter mode ${filterMode} is approximated with glTF alpha BLEND; additive/modulate fidelity is pending`);
+    }
+  } else {
+    material.setAlphaMode('OPAQUE');
+  }
+
+  if ((shading & 16) !== 0) material.setDoubleSided(true);
+  if ((shading & 2) !== 0) {
+    warn(`Material ${materialIndex} layer ${layerIndex}: sphere environment mapping is not represented by core glTF materials`);
+  }
+  if (Number(layer?.TVertexAnimId ?? -1) >= 0) {
+    warn(`Material ${materialIndex} layer ${layerIndex}: texture-coordinate animation ${layer.TVertexAnimId} is not yet exported; static UVs are used`);
+  }
+  if (layer?.TextureID && typeof layer.TextureID === 'object') {
+    warn(`Material ${materialIndex} layer ${layerIndex}: animated TextureID is sampled at its first key only`);
+  }
+  if (layer?.Alpha && typeof layer.Alpha === 'object') {
+    warn(`Material ${materialIndex} layer ${layerIndex}: animated layer alpha is sampled at its first key only`);
+  }
+  for (const property of ['NormalTextureID', 'ORMTextureID', 'EmissiveTextureID', 'TeamColorTextureID', 'ReflectionsTextureID']) {
+    if (layer?.[property] !== undefined && layer?.[property] !== null) {
+      warn(`Material ${materialIndex} layer ${layerIndex}: Reforged ${property} map is present but not yet connected to a glTF PBR texture slot`);
+    }
+  }
+
+  material.setExtras({
+    warcraft3: {
+      materialIndex,
+      layerIndex,
+      textureId,
+      coordId,
+      filterMode,
+      replaceableId: Number(textures[textureId]?.ReplaceableId ?? 0),
+    },
+  });
+  return material;
 }
 
 /** WC3 Z-up → glTF Y-up: (x,y,z) → (x, z, -y) */
@@ -450,15 +625,29 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
   const doc = new Document();
   const buffer = doc.createBuffer();
 
-  // Textures
+  // Textures — resolve paths conservatively and preserve replaceable-texture diagnostics.
   const textureSlots: (ReturnType<Document['createTexture']> | null)[] = [];
   const textures = model.Textures || [];
-  for (const t of textures) {
-    const resolved = resolveTexture(t.Image, textureIndex, relPath);
+  let resolvedTextureCount = 0;
+  const warnTexture = (message: string): void => {
+    console.warn(`[Texture Warning] ${relPath}: ${message}`);
+  };
+
+  for (let ti = 0; ti < textures.length; ti++) {
+    const textureEntry = textures[ti];
+    const resolved = resolveTexture(textureEntry.Image, textureIndex, relPath, warnTexture);
+
     if (!resolved) {
       textureSlots.push(null);
+      const replaceableId = Number(textureEntry?.ReplaceableId ?? 0);
+      if (replaceableId > 0) {
+        warnTexture(`texture slot ${ti} has ReplaceableId ${replaceableId} (image="${textureEntry.Image || ''}"); no replacement texture assigned`);
+      } else if (textureEntry?.Image) {
+        warnTexture(`texture slot ${ti} could not resolve "${textureEntry.Image}"`);
+      }
       continue;
     }
+
     try {
       const pngBuf = blpToPngBuffer(resolved);
       const tex = doc
@@ -466,33 +655,61 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
         .setMimeType('image/png')
         .setImage(new Uint8Array(pngBuf));
       textureSlots.push(tex);
-    } catch {
+      resolvedTextureCount++;
+      console.log(`[Texture] ${relPath}: slot ${ti} "${textureEntry.Image}" -> ${path.relative(textureIndex.root, resolved)}`);
+    } catch (error: any) {
       textureSlots.push(null);
+      warnTexture(`failed to decode texture slot ${ti} (${resolved}): ${error?.message || String(error)}`);
     }
   }
+  console.log(`[Texture] ${relPath}: ${resolvedTextureCount}/${textures.length} texture file(s) resolved`);
 
-  // Materials
+  // Materials — preserve each MDX layer as an ordered glTF primitive/material
+  // pass. Core glTF cannot reproduce all Warcraft blend operations exactly,
+  // but this is better than silently discarding every layer after Layers[0].
   const materials = model.Materials || [];
-  const gltfMaterials: ReturnType<Document['createMaterial']>[] = [];
+  const layerMaterialsByMaterial: ReturnType<Document['createMaterial']>[][] = [];
   for (let mi = 0; mi < materials.length; mi++) {
-    const mat = materials[mi];
-    const layer = (mat.Layers && mat.Layers[0]) || null;
-    const gmat = doc.createMaterial(`mat_${mi}`);
-    gmat.setMetallicFactor(0);
-    gmat.setRoughnessFactor(1);
+    const material = materials[mi];
+    const layers = Array.isArray(material?.Layers) ? material.Layers : [];
+    const exportedLayers: ReturnType<Document['createMaterial']>[] = [];
 
-    if (layer) {
-      const texId = typeof layer.TextureID === 'number' ? layer.TextureID : 0;
-      const tex = textureSlots[texId] ?? null;
-      if (tex) gmat.setBaseColorTexture(tex);
-      const fm = layer.FilterMode ?? 0;
-      if (fm === 1) gmat.setAlphaMode('MASK').setAlphaCutoff(0.75);
-      else if (fm >= 2) gmat.setAlphaMode('BLEND');
+    console.log(`[Material] ${relPath}: material ${mi}, ${layers.length} layer(s)`);
+    if (layers.length > 1) {
+      warnTexture(`material ${mi} has ${layers.length} layers; exporting each as an ordered geometry pass. Non-core blend modes are approximations`);
     }
-    gltfMaterials.push(gmat);
+
+    for (let li = 0; li < layers.length; li++) {
+      const layer = layers[li];
+      const textureId = Math.trunc(readStaticNumeric(layer?.TextureID, 0));
+      const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
+      const filterMode = Math.trunc(readStaticNumeric(layer?.FilterMode, 0));
+      const sourceTexture = textures[textureId];
+      console.log(
+        `[Material]   layer ${li}: TextureID=${textureId}, image="${sourceTexture?.Image || ''}", ` +
+        `ReplaceableId=${Number(sourceTexture?.ReplaceableId ?? 0)}, CoordId=${coordId}, ` +
+        `FilterMode=${filterMode}, Alpha=${readStaticNumeric(layer?.Alpha, 1)}`
+      );
+
+      const gltfMaterial = createLayerMaterial(
+        doc, mi, li, layer, textures, textureSlots, warnTexture
+      );
+      if (gltfMaterial) exportedLayers.push(gltfMaterial);
+    }
+
+    if (exportedLayers.length === 0) {
+      const fallback = doc.createMaterial(`mat_${mi}_untextured`)
+        .setMetallicFactor(0)
+        .setRoughnessFactor(1);
+      exportedLayers.push(fallback);
+      if (layers.length > 0) warnTexture(`material ${mi} has no layer with a resolved texture; using an untextured fallback material`);
+    }
+    layerMaterialsByMaterial.push(exportedLayers);
   }
-  if (!gltfMaterials.length) {
-    gltfMaterials.push(doc.createMaterial('default').setMetallicFactor(0).setRoughnessFactor(1));
+  if (layerMaterialsByMaterial.length === 0) {
+    layerMaterialsByMaterial.push([
+      doc.createMaterial('default').setMetallicFactor(0).setRoughnessFactor(1),
+    ]);
   }
 
   // Bones & Nodes — Stage 2 pivot-aware bind-pose reconstruction.
@@ -599,7 +816,7 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
     const g = geosets[gi];
     const positions = g.Vertices;
     const normals = g.Normals;
-    const uvs = g.TVertices && g.TVertices.length > 0 ? g.TVertices[0] : null;
+    const uvSets: ArrayLike<number>[] = Array.isArray(g.TVertices) ? g.TVertices : [];
     const indices = g.Faces;
 
     if (!positions || !indices || positions.length < 3) continue;
@@ -622,16 +839,23 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
       );
     }
 
-    if (uvs && uvs.length === vertCount * 2) {
+    const validUvSetIndices = new Set<number>();
+    for (let uvIndex = 0; uvIndex < uvSets.length; uvIndex++) {
+      const uvs = uvSets[uvIndex];
+      if (!uvs || uvs.length !== vertCount * 2) {
+        console.warn(`[Texture Warning] ${relPath} geoset ${gi}: UV set ${uvIndex} has ${uvs?.length ?? 0} values; expected ${vertCount * 2}; set skipped`);
+        continue;
+      }
       const flipped = new Float32Array(uvs.length);
       for (let i = 0; i < vertCount; i++) {
-        flipped[i * 2] = uvs[i * 2];
-        flipped[i * 2 + 1] = 1 - uvs[i * 2 + 1];
+        flipped[i * 2] = Number(uvs[i * 2]);
+        flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1]);
       }
       prim.setAttribute(
-        'TEXCOORD_0',
-        doc.createAccessor(`uv_${gi}`).setType('VEC2').setArray(flipped).setBuffer(buffer)
+        `TEXCOORD_${uvIndex}`,
+        doc.createAccessor(`uv_${gi}_${uvIndex}`).setType('VEC2').setArray(flipped).setBuffer(buffer)
       );
+      validUvSetIndices.add(uvIndex);
     }
 
     let hasSkinningAttributes = false;
@@ -723,11 +947,36 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
       console.warn(`[Skin Warning] ${relPath} geoset ${gi}: Reforged SkinWeights data is present but not yet decoded; this Stage 2 converter currently uses classic VertexGroup/Groups skinning`);
     }
 
-    const matId = Math.min(g.MaterialID ?? 0, gltfMaterials.length - 1);
-    prim.setMaterial(gltfMaterials[matId]);
-    prim.setMode(Primitive.Mode.TRIANGLES);
+    const rawMatId = Number(g.MaterialID ?? 0);
+    const matId = Number.isInteger(rawMatId) && rawMatId >= 0 && rawMatId < layerMaterialsByMaterial.length
+      ? rawMatId
+      : 0;
+    if (matId !== rawMatId) {
+      warnTexture(`geoset ${gi} references invalid MaterialID ${rawMatId}; material 0 fallback used`);
+    }
 
-    const mesh = doc.createMesh(`geoset_${gi}`).addPrimitive(prim);
+    const geosetLayers = layerMaterialsByMaterial[matId] || layerMaterialsByMaterial[0];
+    const requestedCoordIds = geosetLayers
+      .map((material) => Number((material.getExtras() as any)?.warcraft3?.coordId ?? 0));
+    for (const coordId of requestedCoordIds) {
+      if (!validUvSetIndices.has(coordId)) {
+        warnTexture(`geoset ${gi} uses material UV set ${coordId}, but that UV set is not available on this geoset; available sets: ${[...validUvSetIndices].join(', ') || '(none)'}`);
+      }
+    }
+    console.log(`[Texture] ${relPath}: geoset ${gi}, MaterialID=${matId}, UV sets=[${[...validUvSetIndices].join(', ')}], material passes=${geosetLayers.length}`);
+
+    prim.setMode(Primitive.Mode.TRIANGLES);
+    const mesh = doc.createMesh(`geoset_${gi}`);
+    geosetLayers.forEach((layerMaterial, layerPassIndex) => {
+      // A material's layers are rendered in order on the same geoset. Reuse
+      // the exact same geometry/skin accessors for each pass.
+      const layerPrimitive = layerPassIndex === 0
+        ? prim
+        : prim.clone() as ReturnType<Document['createPrimitive']>;
+      layerPrimitive.setMaterial(layerMaterial);
+      mesh.addPrimitive(layerPrimitive);
+    });
+
     const meshNode = doc.createNode(`mesh_${gi}`).setMesh(mesh);
     if (skin && hasSkinningAttributes) meshNode.setSkin(skin);
     meshNodes.push(meshNode);
