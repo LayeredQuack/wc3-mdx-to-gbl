@@ -185,6 +185,64 @@ function wc3ToGltfScale(src: ArrayLike<number>): Float32Array {
   return new Float32Array([src[0], src[2], src[1]]);
 }
 
+/**
+ * Get a node's MDX model-space pivot. war3-model normally exposes PivotPoint
+ * directly on the node; PivotPoints is retained as a compatibility fallback.
+ */
+function getMdxNodePivot(node: any, model: any): Float32Array {
+  const direct = node?.PivotPoint;
+  const indexed = model?.PivotPoints?.[node?.ObjectId];
+  const valid = (v: any): boolean =>
+    !!v && v.length >= 3 && Number.isFinite(Number(v[0])) &&
+    Number.isFinite(Number(v[1])) && Number.isFinite(Number(v[2]));
+
+  if (valid(direct)) {
+    const directVec = [Number(direct[0]), Number(direct[1]), Number(direct[2])];
+    const indexedVec = valid(indexed)
+      ? [Number(indexed[0]), Number(indexed[1]), Number(indexed[2])]
+      : null;
+    // Some parser/model variants leave Node.PivotPoint zeroed while retaining
+    // the PIVT table. Prefer a non-zero indexed pivot in that case.
+    const directIsZero = directVec.every(v => Math.abs(v) < 1e-8);
+    const indexedIsNonZero = !!indexedVec && indexedVec.some(v => Math.abs(v) >= 1e-8);
+    const chosen = directIsZero && indexedIsNonZero ? indexedVec! : directVec;
+    return new Float32Array(chosen);
+  }
+
+  if (valid(indexed)) {
+    return new Float32Array([Number(indexed[0]), Number(indexed[1]), Number(indexed[2])]);
+  }
+
+  return new Float32Array([0, 0, 0]);
+}
+
+/** Subtract two 3D vectors, returning a fresh vector. */
+function subtractVec3(a: ArrayLike<number>, b: ArrayLike<number>): Float32Array {
+  return new Float32Array([
+    Number(a[0]) - Number(b[0]),
+    Number(a[1]) - Number(b[1]),
+    Number(a[2]) - Number(b[2])
+  ]);
+}
+
+/**
+ * Build a glTF inverse-bind matrix for a joint whose bind-pose world transform
+ * is a pure translation to its MDX pivot. glTF MAT4 accessors are column-major.
+ */
+function writeInversePivotMatrix(
+  target: Float32Array,
+  offset: number,
+  pivotGltf: ArrayLike<number>
+): void {
+  target[offset + 0] = 1;
+  target[offset + 5] = 1;
+  target[offset + 10] = 1;
+  target[offset + 12] = -Number(pivotGltf[0]);
+  target[offset + 13] = -Number(pivotGltf[1]);
+  target[offset + 14] = -Number(pivotGltf[2]);
+  target[offset + 15] = 1;
+}
+
 interface MdxAnimationKey {
   Frame: number;
   Vector: ArrayLike<number>;
@@ -202,7 +260,7 @@ type GltfInterpolation = 'STEP' | 'LINEAR';
 
 /**
  * MDX line types: DontInterp=0, Linear=1, Hermite=2, Bezier=3.
- * Stage 1 maps the first two exactly. Hermite/Bezier are temporarily sampled
+ * The exporter maps the first two exactly. Hermite/Bezier are temporarily sampled
  * linearly; their tangent-aware conversion is deliberately reserved for Stage 3.
  */
 function getGltfInterpolation(
@@ -216,10 +274,10 @@ function getGltfInterpolation(
     case undefined:
       return 'LINEAR';
     case 2:
-      warn('MDX Hermite interpolation found; exported as LINEAR for Stage 1 (tangent support is pending)');
+      warn('MDX Hermite interpolation found; exported as LINEAR (tangent-aware interpolation is pending)');
       return 'LINEAR';
     case 3:
-      warn('MDX Bezier interpolation found; exported as LINEAR for Stage 1 (tangent support is pending)');
+      warn('MDX Bezier interpolation found; exported as LINEAR (tangent-aware interpolation is pending)');
       return 'LINEAR';
     default:
       warn(`Unknown MDX interpolation type ${track.LineType}; exported as LINEAR`);
@@ -245,7 +303,8 @@ function addMdxAnimationTrack(
   componentCount: 3 | 4,
   convert: (value: ArrayLike<number>) => ArrayLike<number>,
   accessorName: string,
-  warn: (message: string) => void
+  warn: (message: string) => void,
+  valueOffset?: ArrayLike<number>
 ): boolean {
   if (!track?.Keys?.length) return false;
 
@@ -297,7 +356,13 @@ function addMdxAnimationTrack(
     }
 
     const converted = convert(key.Vector);
-    const values = Array.from({ length: componentCount }, (_, i) => Number(converted[i]));
+    // glTF animation channels replace the node's base TRS value. For MDX
+    // translation tracks we therefore add the static local pivot offset back
+    // into every key so the joint continues to rotate around its authored pivot.
+    const values = Array.from(
+      { length: componentCount },
+      (_, i) => Number(converted[i]) + (targetPath === 'translation' ? Number(valueOffset?.[i] ?? 0) : 0)
+    );
     if (!values.every(Number.isFinite)) {
       invalidKeyCount++;
       continue;
@@ -430,19 +495,57 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
     gltfMaterials.push(doc.createMaterial('default').setMetallicFactor(0).setRoughnessFactor(1));
   }
 
-  // Bones & Nodes
+  // Bones & Nodes — Stage 2 pivot-aware bind-pose reconstruction.
   const bones = model.Bones || [];
   const helpers = model.Helpers || [];
-  const allNodes = [...bones, ...helpers];
+  // war3-model stores every MDX object node (bones, helpers, attachments,
+  // emitters, lights, event objects, etc.) in model.Nodes indexed by ObjectId.
+  // Use that complete list so a bone whose parent is not itself a Bone/Helper
+  // retains the correct ancestor chain and can still receive transform tracks.
+  const parsedNodes = Array.isArray(model.Nodes)
+    ? model.Nodes.filter((n: any) => !!n && Number.isInteger(n.ObjectId))
+    : [];
+  const allNodes = parsedNodes.length > 0 ? parsedNodes : [...bones, ...helpers];
   const nodeByObjectId = new Map<number, ReturnType<Document['createNode']>>();
+  const pivotByObjectId = new Map<number, Float32Array>();
+  const localPivotByObjectId = new Map<number, Float32Array>();
 
+  for (const n of allNodes) {
+    const pivot = getMdxNodePivot(n, model);
+    pivotByObjectId.set(n.ObjectId, pivot);
+
+    // glTF's ordinary node hierarchy always inherits parent TRS. MDX can
+    // selectively disable translation, rotation, or scale inheritance; those
+    // flags need a dedicated proxy/baked-transform strategy and are reported
+    // rather than silently treated as equivalent.
+    const flags = Number(n.Flags ?? 0);
+    const noInherit: string[] = [];
+    if (flags & 0x1) noInherit.push('translation');
+    if (flags & 0x2) noInherit.push('rotation');
+    if (flags & 0x4) noInherit.push('scale');
+    if (noInherit.length > 0) {
+      console.warn(`[Skeleton Warning] ${relPath}: node ${n.ObjectId} (${n.Name || 'unnamed'}) disables parent ${noInherit.join('/')} inheritance; Stage 2 currently uses standard glTF parent inheritance for this node`);
+    }
+  }
+
+  let missingParentCount = 0;
   for (const n of allNodes) {
     const gnode = doc.createNode(n.Name || `node_${n.ObjectId}`);
     nodeByObjectId.set(n.ObjectId, gnode);
 
-    // Keep glTF's neutral local TRS defaults here. MDX animated TRS values are
-    // exported as sequence channels below. Pivot-aware bind-pose reconstruction
-    // is intentionally handled in Stage 2 rather than guessed in Stage 1.
+    const pivot = pivotByObjectId.get(n.ObjectId)!;
+    const parentPivot = n.Parent != null && n.Parent >= 0
+      ? pivotByObjectId.get(n.Parent)
+      : undefined;
+
+    // MDX pivot positions are model-space coordinates. Convert them to local
+    // offsets relative to the parent's pivot; root nodes use their model pivot.
+    // This makes the bind-pose world transform of each node T(pivot).
+    if (n.Parent != null && n.Parent >= 0 && !parentPivot) missingParentCount++;
+    const localPivotMdx = parentPivot ? subtractVec3(pivot, parentPivot) : pivot;
+    const localPivotGltf = wc3ToGltfVec3(localPivotMdx);
+    localPivotByObjectId.set(n.ObjectId, localPivotGltf);
+    gnode.setTranslation([localPivotGltf[0], localPivotGltf[1], localPivotGltf[2]]);
   }
 
   for (const n of allNodes) {
@@ -453,7 +556,19 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
     }
   }
 
-  // Skin Setup
+  const nonZeroPivotCount = [...pivotByObjectId.values()].filter(
+    p => Math.abs(p[0]) > 1e-8 || Math.abs(p[1]) > 1e-8 || Math.abs(p[2]) > 1e-8
+  ).length;
+  console.log(`[Skeleton] ${relPath}: ${bones.length} bone(s), ${helpers.length} helper(s), ${nonZeroPivotCount} non-zero pivot(s)`);
+  if (missingParentCount > 0) {
+    console.warn(`[Skeleton Warning] ${relPath}: ${missingParentCount} node(s) reference a parent ObjectId absent from model.Nodes; those nodes were rooted at their model-space pivot`);
+  }
+  if (model.BindPoses?.length) {
+    console.warn(`[Skeleton Warning] ${relPath}: ${model.BindPoses.length} BPOS bind-pose record(s) detected; this Stage 2 path currently reconstructs classic pivot bind poses and does not yet decode Reforged BPOS matrices`);
+  }
+
+  // Skin setup. The inverse bind matrix is the inverse of the bind-pose world
+  // transform. With MDX's pivot hierarchy, that rest transform is T(pivot).
   let skin: ReturnType<Document['createSkin']> | null = null;
   if (bones.length > 0) {
     skin = doc.createSkin('Armature');
@@ -461,16 +576,17 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
       const jn = nodeByObjectId.get(b.ObjectId);
       if (jn) skin.addJoint(jn);
     }
+
     const ibmData = new Float32Array(bones.length * 16);
     for (let i = 0; i < bones.length; i++) {
-      ibmData[i * 16 + 0] = 1;
-      ibmData[i * 16 + 5] = 1;
-      ibmData[i * 16 + 10] = 1;
-      ibmData[i * 16 + 15] = 1;
+      const pivotMdx = pivotByObjectId.get(bones[i].ObjectId) || new Float32Array([0, 0, 0]);
+      const pivotGltf = wc3ToGltfVec3(pivotMdx);
+      writeInversePivotMatrix(ibmData, i * 16, pivotGltf);
     }
     skin.setInverseBindMatrices(
       doc.createAccessor('IBM').setType('MAT4').setArray(ibmData).setBuffer(buffer)
     );
+    console.log(`[Skeleton] ${relPath}: generated ${bones.length} pivot-derived inverse bind matrix/matrices`);
   }
 
   // Geosets
@@ -518,28 +634,72 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
       );
     }
 
+    let hasSkinningAttributes = false;
     if (skin && g.VertexGroup && g.Groups && g.Groups.length > 0) {
       const joints = new Uint16Array(vertCount * 4);
       const weights = new Float32Array(vertCount * 4);
+      // Pick the highest bone joint in the hierarchy for malformed-group
+      // fallback, walking through non-bone ancestors such as Helpers. A bone
+      // can be parented to a Helper, so checking only its immediate parent
+      // would incorrectly classify it as a root joint.
+      const findRootBoneIndex = (): number => {
+        for (let bi = 0; bi < bones.length; bi++) {
+          let parentId = bones[bi].Parent;
+          let hasBoneAncestor = false;
+          const visited = new Set<number>();
+          while (parentId != null && parentId >= 0 && !visited.has(parentId)) {
+            visited.add(parentId);
+            if (jointIndex.has(parentId)) {
+              hasBoneAncestor = true;
+              break;
+            }
+            const parentNode = allNodes.find(n => n.ObjectId === parentId);
+            if (!parentNode) break;
+            parentId = parentNode.Parent;
+          }
+          if (!hasBoneAncestor) return bi;
+        }
+        return 0;
+      };
+      const rootBoneIndex = findRootBoneIndex();
+      let invalidGroupReferences = 0;
+      let invalidBoneReferences = 0;
+      let fallbackVertexCount = 0;
+      let truncatedInfluenceGroups = 0;
+
       for (let v = 0; v < vertCount; v++) {
-        const groupIdx = g.VertexGroup[v];
-        const boneIds = g.Groups[groupIdx] || [];
+        const groupIdx = Number(g.VertexGroup[v]);
+        const boneIds = Number.isInteger(groupIdx) ? (g.Groups[groupIdx] || []) : [];
+        if (!g.Groups[groupIdx]) invalidGroupReferences++;
+        if (boneIds.length > 4) truncatedInfluenceGroups++;
+
         const nInf = Math.min(boneIds.length, 4);
         let wSum = 0;
+        let validSlot = 0;
         for (let k = 0; k < nInf; k++) {
-          const jIdx = jointIndex.get(boneIds[k]);
+          // Classic MDX MATS entries refer to node ObjectIds, not glTF joint indices.
+          const jIdx = jointIndex.get(Number(boneIds[k]));
           if (jIdx != null) {
-            joints[v * 4 + k] = jIdx;
-            weights[v * 4 + k] = 1;
+            joints[v * 4 + validSlot] = jIdx;
+            weights[v * 4 + validSlot] = 1;
             wSum += 1;
+            validSlot++;
+          } else {
+            invalidBoneReferences++;
           }
         }
+
         if (wSum > 0) {
           for (let k = 0; k < 4; k++) weights[v * 4 + k] /= wSum;
         } else {
+          // Preserve a valid, normalized influence but make the fallback visible
+          // in diagnostics instead of silently masking malformed group data.
+          joints[v * 4] = rootBoneIndex;
           weights[v * 4] = 1;
+          fallbackVertexCount++;
         }
       }
+
       prim.setAttribute(
         'JOINTS_0',
         doc.createAccessor(`joints_${gi}`).setType('VEC4').setArray(joints).setBuffer(buffer)
@@ -548,6 +708,19 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
         'WEIGHTS_0',
         doc.createAccessor(`weights_${gi}`).setType('VEC4').setArray(weights).setBuffer(buffer)
       );
+      hasSkinningAttributes = true;
+
+      if (invalidGroupReferences > 0 || invalidBoneReferences > 0 || fallbackVertexCount > 0 || truncatedInfluenceGroups > 0) {
+        console.warn(
+          `[Skin Warning] ${relPath} geoset ${gi}: ${invalidGroupReferences} invalid vertex-group reference(s), ` +
+          `${invalidBoneReferences} unresolved bone ObjectId reference(s), ${fallbackVertexCount} fallback vertex/vertices, ` +
+          `${truncatedInfluenceGroups} group(s) with more than four influences`
+        );
+      }
+    }
+
+    if (g.SkinWeights && g.SkinWeights.length > 0) {
+      console.warn(`[Skin Warning] ${relPath} geoset ${gi}: Reforged SkinWeights data is present but not yet decoded; this Stage 2 converter currently uses classic VertexGroup/Groups skinning`);
     }
 
     const matId = Math.min(g.MaterialID ?? 0, gltfMaterials.length - 1);
@@ -556,11 +729,11 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
 
     const mesh = doc.createMesh(`geoset_${gi}`).addPrimitive(prim);
     const meshNode = doc.createNode(`mesh_${gi}`).setMesh(mesh);
-    if (skin) meshNode.setSkin(skin);
+    if (skin && hasSkinningAttributes) meshNode.setSkin(skin);
     meshNodes.push(meshNode);
   }
 
-  // ── Stage 1: Sequence / Animation Extraction ──────────────────────────────
+  // ── Animation Export (Stage 1 retained; Stage 2 pivot-aware skeleton) ─────
   // war3-model exposes node tracks as AnimVector objects with Keys[] and
   // key.Vector values. Do not treat tracks as arrays of Frame/Values fields.
   const sequences = model.Sequences || [];
@@ -602,7 +775,8 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
         doc, buffer, animation, gnode,
         n.Translation as MdxAnimationTrack | undefined,
         seqStart, seqEnd, globalSequences.length, 'translation', 'VEC3', 3,
-        wc3ToGltfVec3, `${prefix}_translation`, warnAnimation
+        wc3ToGltfVec3, `${prefix}_translation`, warnAnimation,
+        localPivotByObjectId.get(n.ObjectId)
       )) channelCount++;
 
       if (addMdxAnimationTrack(
@@ -631,13 +805,13 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
   }
 
   if (sequences.length > 0 && exportedAnimationChannels === 0) {
-    console.warn(`[Animation] ${relPath}: sequences exist, but no bone/helper transform channels were exported. Check whether tracks contain Keys in the sequence intervals or use global sequences.`);
+    console.warn(`[Animation] ${relPath}: sequences exist, but no node transform channels were exported. The model may animate non-transform properties (particle emitters, visibility, geoset/material animation), use only global sequences, or contain no transform keys in its sequence intervals.`);
   }
   console.log(`[Animation] ${relPath}: exported ${exportedAnimationClips} clip(s), ${exportedAnimationChannels} channel(s)`);
 
   // Scene
   const scene = doc.createScene(model.Info?.Name || 'Scene');
-  for (const n of allNodes.filter(n => n.Parent == null || n.Parent < 0)) {
+  for (const n of allNodes.filter(n => n.Parent == null || n.Parent < 0 || !nodeByObjectId.has(n.Parent))) {
     const gn = nodeByObjectId.get(n.ObjectId);
     if (gn) scene.addChild(gn);
   }
@@ -658,16 +832,18 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
 
 // ── Main Execution ──────────────────────────────────────────────────────────
 async function runStandaloneConversion() {
+  // Usage: npx tsx convert-models.ts [input-directory] [--output output-directory]
+  // The positional input folder and --output option keep the configurable
+  // directory behavior used by the current repository version.
   const args = process.argv.slice(2);
   let inputDirArg = './wc3_extracts';
   let outputDirArg = 'converted-glb';
-
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--output' && i + 1 < args.length) {
       outputDirArg = args[++i];
     } else if (arg.startsWith('--output=')) {
-      outputDirArg = arg.substring(9);
+      outputDirArg = arg.substring('--output='.length);
     } else if (!arg.startsWith('-')) {
       inputDirArg = arg;
     }
