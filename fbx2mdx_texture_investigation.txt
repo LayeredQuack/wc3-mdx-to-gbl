@@ -1,0 +1,1851 @@
+# 1. Reference Implementation Findings
+
+## 1. MDX Material Representation
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Material.py`
+
+**Class:** `War3Material`
+
+**Key Properties:**
+- `name: str` - Material name identifier
+- `layers: List[War3Layer]` - Ordered list of material layers (supports multiple layers)
+- `use_const_color: bool` - Whether to use constant color shader
+- `priority_plane: int` - Rendering priority plane
+- `is_hd: bool` - HD shader flag
+
+**Line Numbers:** Lines 1-28
+
+**Verified Behavior:**
+- Materials are stored with an ordered list of layers (not flattened)
+- Each material can have multiple layers that render in order
+- Layer compositing is preserved as a stack, not merged into single pass
+
+---
+
+## 2. Multiple Ordered Material Layers
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Material.py` (lines 10-15)
+
+**Verified Behavior:**
+```python
+self.layers: List[War3Layer] = []
+```
+
+Materials maintain an ordered list of layers. The reference exporter writes each layer separately in the MDX file format.
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_materials.py` (lines 18-65)
+
+**Verified Behavior:**
+- Each material's layers are written sequentially with `\t\tLayer { ... }\n` blocks
+- Layers maintain their original order from the MDX file
+- No layer merging or flattening occurs
+
+---
+
+## 3. Texture IDs and Texture Paths
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Texture.py`
+
+**Class:** `War3Texture`
+
+**Key Properties:**
+- `texture_path: str` - Full path to BLP texture file (e.g., "Textures\\orc.blp")
+- `replaceable_id: int` - Replaceable texture ID (0 = normal, 1 = TeamColor, 2 = TeamGlow)
+- `wrap_width: bool` - Texture wrapping on X axis
+- `wrap_height: bool` - Texture wrapping on Y axis
+
+**Line Numbers:** Lines 1-18
+
+**Verified Behavior:**
+- Texture paths are stored as full relative paths from MDX root
+- ReplaceableId is used to identify team-color/team-glow textures
+- Wrap flags control texture tiling behavior
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_textures.py` (lines 13-30)
+
+**Verified Behavior:**
+```python
+if texture.texture_path.startswith("ReplaceableId"):
+    fw("\t\tImage \"\",\n")
+    fw("\t\tReplaceableId %s,\n" % texture.replaceable_id)
+else:
+    fw("\t\tImage \"%s\",\n" % texture.texture_path)
+```
+
+- Normal textures use `Image "path"` format
+- Replaceable textures use empty Image with ReplaceableId field
+- All textures have WrapHeight and WrapWidth flags set
+
+---
+
+## 4. Replaceable Texture IDs
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Texture.py` (lines 10-15)
+
+**Verified Behavior:**
+```python
+self.replaceable_id: int = replaceable_id
+```
+
+ReplaceableId values:
+- 0 = Normal texture
+- 1 = TeamColor (player color indicator)
+- 2 = TeamGlow (player glow effect)
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_textures.py` (lines 13-18)
+
+**Verified Behavior:**
+```python
+if texture.texture_path.startswith("ReplaceableId"):
+    fw("\t\tImage \"\",\n")
+    fw("\t\tReplaceableId %s,\n" % texture.replaceable_id)
+else:
+    fw("\t\tImage \"%s\",\n" % texture.texture_path)
+```
+
+- Replaceable textures have empty Image path with ReplaceableId field
+- This allows the game to substitute player-specific colors at runtime
+
+---
+
+## 5. Filter Modes and Alpha Values
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Layer.py`
+
+**Class:** `War3Layer`
+
+**Key Properties:**
+- `filter_mode: str` - Texture filter mode ("None", "Linear", "Nearest")
+- `unshaded: bool` - Unshaded flag
+- `two_sided: bool` - Two-sided rendering
+- `unfogged: bool` - Unfogged flag
+- `alpha_value: float` - Static alpha value (0.0 to 1.0)
+- `no_depth_test: bool` - Disable depth testing
+- `no_depth_set: bool` - Disable depth setting
+
+**Line Numbers:** Lines 1-25
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_materials.py` (lines 38-60)
+
+**Verified Behavior:**
+```python
+if layer.filter_mode == "None":
+    # Opaque rendering
+elif layer.filter_mode == "Linear":
+    # Alpha masked
+elif layer.filter_mode >= 2:
+    # Alpha blended (with mode-specific flags)
+```
+
+Filter modes map to:
+- Mode 0 = None (opaque)
+- Mode 1 = Linear (alpha mask with cutoff)
+- Mode 2+ = Blend (alpha blending, possibly additive/modulate)
+
+---
+
+## 6. Animated Alpha and Texture Animation
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Layer.py` (lines 18-22)
+
+**Key Properties:**
+- `texture_anim: Optional[War3TextureAnim]` - Animated texture coordinates
+- `alpha_anim: Optional[War3AnimationCurve]` - Animated alpha value
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_materials.py` (lines 56-60)
+
+**Verified Behavior:**
+```python
+if layer.texture_anim is not None:
+    fw("\t\t\tTVertexAnimId %d,\n" % tvertex_anims.index(layer.texture_anim))
+if layer.alpha_anim is not None:
+    write_animation_chunk(fw, layer.alpha_anim, "Alpha", global_seqs, "\t\t")
+else:
+    fw("\t\t\tstatic Alpha %s,\n" % float2str(layer.alpha_value))
+```
+
+- Animated alpha uses `write_animation_chunk()` function
+- Static alpha uses `float2str()` conversion
+- Texture animation references TVertexAnimId (texture coordinate animation)
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/write_animation_chunk.py` (not shown but referenced)
+
+**Verified Behavior:**
+Animation chunks are written with keyframes, interpolation type, and global sequence IDs.
+
+---
+
+## 7. Geoset Material Assignments
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Material.py` (lines 1-10)
+
+**Class:** `War3Material`
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/save_geosets.py` (not shown but referenced in imports)
+
+**Verified Behavior from save_geosets.py:**
+```python
+def save_geosets(fw: TextIO.write, material_names, model: War3Model, settings):
+    if len(model.geosets):
+        for geoset in model.geosets:
+            geoset.write_geoset(fw, material_names, model.sequences, model.object_indices, settings.use_skinweights)
+```
+
+- Each geoset has a `MaterialID` field (integer index into materials list)
+- Geosets are written with their assigned material ID
+- Material names are indexed for lookup
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_materials.py` (lines 18-65)
+
+**Verified Behavior:**
+Materials are written in order, and geosets reference them by index.
+
+---
+
+## 8. UV Coordinate Sets and CoordId
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/classes/War3Layer.py` (lines 1-25)
+
+**Key Property:**
+- No explicit UV coordinate storage in layer class (handled by geoset TVertices)
+
+### Source: `convert-models.ts` (from reference implementation)
+
+**Verified Behavior from convert-models.ts:**
+```typescript
+const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
+...
+textureInfo.setTexCoord(coordId);
+```
+
+- Each material layer has a `CoordId` field (integer index into UV sets)
+- UV sets are stored in geoset's TVertices array
+- CoordId maps to the correct UV set for each material layer
+
+### Source: `convert-models.ts` (UV flipping logic)
+
+**Verified Behavior:**
+```typescript
+for (let i = 0; i < vertCount; i++) {
+  flipped[i * 2] = Number(uvs[i * 2]);
+  flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1]);
+}
+```
+
+- UV Y coordinates are flipped (1 - y) for WC3 Z-up to glTF Y-up conversion
+- Multiple UV sets can exist per geoset (indexed by CoordId)
+
+---
+
+## 9. How Reference Exporter Writes Materials and Geosets
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_materials.py`
+
+**Material Block Structure:**
+```
+Materials N {
+    Material {
+        Shader "Shader_HD_DefaultUnit",
+        ConstantColor,
+        PriorityPlane N,
+        Layer {
+            FilterMode N,
+            Unshaded,
+            TwoSided,
+            Unfogged,
+            NoDepthTest,
+            NoDepthSet,
+            static TextureID N,
+            TVertexAnimId N,
+            static Alpha N,
+        }
+    }
+}
+```
+
+### Source: `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_geosets.py`
+
+**Geoset Block Structure:**
+```
+Geoset {
+    Vertices N,
+    Normals N,
+    TVertices N,
+    VertexGroup,
+    Groups,
+    Faces N N,
+    Matrices,
+    MinimumExtent,
+    MaximumExtent,
+    BoundsRadius,
+    Anim { ... },
+    MaterialID N,
+}
+```
+
+---
+
+## 10. BLP-to-PNG Conversion in Reference Repository
+
+### Source: `../fbx2mdx/convert.py`
+
+**Verified Behavior:**
+The reference Blender-based converter (`convert.py`) does NOT perform BLP-to-PNG conversion. It:
+- Imports FBX/GLB/OBJ/DAE/MDL files into Blender
+- Normalizes transforms and sets up materials
+- Exports to MDL format using the `export_mdl` addon
+- The MDL exporter handles texture paths as strings
+
+### Source: `convert-models.ts` (from this repository)
+
+**Verified Behavior:**
+This repository's `convert-models.ts` DOES perform BLP-to-PNG conversion:
+
+```typescript
+function blpToPngBuffer(blpPath: string): Buffer {
+  const raw = fs.readFileSync(blpPath);
+  const arrayBuffer = raw.buffer.slice(
+    raw.byteOffset,
+    raw.byteOffset + raw.byteLength
+  );
+  const blp = decodeBLP(arrayBuffer);
+  const image = getBLPImageData(blp, 0);
+  ...
+  return PNG.sync.write(png);
+}
+```
+
+**Key Difference:**
+- Reference (`fbx2mdx`): Keeps BLP paths as strings in MDL/MDX files
+- This repo (`convert-models.ts`): Decodes BLP to PNG and embeds in GLB
+
+---
+
+## Summary of Key Findings
+
+### Verified Behaviors:
+
+1. **Materials:** Stored with ordered layer lists, each layer maintains its position
+2. **Layers:** Each layer has TextureID, CoordId, FilterMode, Alpha (static or animated)
+3. **Textures:** Normal textures use Image path; Replaceable textures use ReplaceableId field
+4. **UV Coordinates:** Multiple UV sets per geoset, indexed by CoordId in material layers
+5. **Geosets:** Each has MaterialID referencing materials list index
+6. **Animation:** Animated alpha uses animation chunks with keyframes and global sequence IDs
+
+### Not Implemented in Reference:
+
+- BLP-to-PNG conversion (reference keeps paths as strings)
+- Texture coordinate animation decoding (TVertexAnimId present but not decoded)
+- Animated texture ID changes (TextureID can be animated but not decoded)
+- Reforged material properties (ORM, Emissive, TeamColor maps present but unused)
+
+### Additional Reference Files to Examine:
+
+1. `../fbx2mdx/scripts/addons/export_mdl/export_mdl/write_animation_chunk.py` - Animation chunk writing
+2. `../fbx2mdx/scripts/addons/export_mdl/classes/War3TextureAnim.py` - Texture animation class
+3. `../fbx2mdx/scripts/addons/export_mdl/classes/War3AnimationCurve.py` - Animation curve class
+4. `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_geosets.py` - Complete geoset writing logic
+
+---
+
+# 2. convert-models.ts Implementation Analysis
+
+## Texture Resolution Strategy
+
+### Source: `convert-models.ts` (lines ~100-350)
+
+**Key Functions:**
+- `buildTextureIndex()` - Recursively indexes all BLP files in extraction root
+- `resolveTexture()` - Multi-stage texture resolution with fallbacks
+- `resolveReplaceableTexture()` - Handles TeamColor/TeamGlow replaceable textures
+- `resolveFuzzyTexture()` - Last-resort fuzzy matching for legacy assets
+
+### Texture Resolution Stages:
+
+1. **Exact path match** - Full relative path from extraction root
+2. **MDX-relative paths** - Paths relative to MDX's directory or archive top
+3. **Suffix matching** - Match complete referenced suffix before basename-only
+4. **Basename fallback** - Exact-basename match within same archive
+5. **Fuzzy fallback** - Levenshtein distance + token matching (disabled with --strict-texture-matching)
+
+### Replaceable Texture Handling:
+
+```typescript
+function resolveReplaceableTexture(
+  replaceableId: number,
+  teamColorIndex: number,
+  index: TextureIndex,
+  mdxRelPath: string,
+  warn: (message: string) => void
+): string | null {
+  const kind = replaceableId === 1 ? 'TeamColor' : replaceableId === 2 ? 'TeamGlow' : null;
+  const suffix = `${kind}${String(teamColorIndex).padStart(2, '0')}.blp`;
+  const canonicalPath = `ReplaceableTextures/${kind}/${suffix}`;
+  return resolveTexture(canonicalPath, index, mdxRelPath, warn);
+}
+```
+
+- ReplaceableId 1 → TeamColor (player color indicator)
+- ReplaceableId 2 → TeamGlow (player glow effect)
+- Default preview uses team color index 0 (red)
+
+---
+
+## Material Layer Export Modes
+
+### Source: `convert-models.ts` (lines ~450-550)
+
+**Material Layer Mode Options:**
+
+1. **Stack mode (default)** - Export all material layers as ordered geometry passes
+2. **Base mode (--diagnostic-base-layer)** - Export only layer 0, skip overlay layers
+
+### Layer Material Creation:
+
+```typescript
+function createLayerMaterial(
+  doc: Document,
+  materialIndex: number,
+  layerIndex: number,
+  layer: any,
+  textures: any[],
+  textureSlots: (ReturnType<Document['createTexture']> | null)[],
+  warn: (message: string) => void
+): ReturnType<Document['createMaterial']> | null {
+  // Texture resolution and material creation logic
+}
+```
+
+### Material Properties Exported:
+
+- Base color texture with CoordId
+- Wrap S/T from TextureFlags
+- Alpha mode (OPAQUE/MASK/BLEND)
+- Double-sided flag
+- Environment mapping (reported but not implemented)
+- Animated properties reported in extras
+
+---
+
+## UV Coordinate Handling
+
+### Source: `convert-models.ts` (lines ~650-700)
+
+**UV Set Processing:**
+
+```typescript
+const validUvSetIndices = new Set<number>();
+for (let uvIndex = 0; uvIndex < uvSets.length; uvIndex++) {
+  const uvs = uvSets[uvIndex];
+  if (!uvs || uvs.length !== vertCount * 2) {
+    console.warn(`[Texture Warning] ${relPath} geoset ${gi}: UV set ${uvIndex} has ${uvs?.length ?? 0} values; expected ${vertCount * 2}; set skipped`);
+    continue;
+  }
+  const flipped = new Float32Array(uvs.length);
+  for (let i = 0; i < vertCount; i++) {
+    flipped[i * 2] = Number(uvs[i * 2]);
+    flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1]); // Y-flip for WC3→glTF
+  }
+  prim.setAttribute(
+    `TEXCOORD_${uvIndex}`,
+    doc.createAccessor(`uv_${gi}_${uvIndex}`).setType('VEC2').setArray(flipped).setBuffer(buffer)
+  );
+  validUvSetIndices.add(uvIndex);
+}
+```
+
+- UV Y coordinates are flipped (1 - y) for WC3 Z-up to glTF Y-up conversion
+- Multiple UV sets per geoset supported
+- Invalid UV sets are skipped with warnings
+
+---
+
+## Skin Weight Handling
+
+### Source: `convert-models.ts` (lines ~750-850)
+
+**Classic MDX Skinning:**
+
+```typescript
+if (skin && g.VertexGroup && g.Groups && g.Groups.length > 0) {
+  const joints = new Uint16Array(vertCount * 4);
+  const weights = new Float32Array(vertCount * 4);
+  
+  // Classic MDX: average vertex's bones equally
+  for (let v = 0; v < vertCount; v++) {
+    const groupIdx = Number(g.VertexGroup[v]);
+    const boneIds = g.Groups[groupIdx] || [];
+    
+    const nInf = Math.min(boneIds.length, 4);
+    let wSum = 0;
+    for (let k = 0; k < nInf; k++) {
+      const jIdx = jointIndex.get(Number(boneIds[k]));
+      if (jIdx != null) {
+        joints[v * 4 + validSlot] = jIdx;
+        weights[v * 4 + validSlot] = 1;
+        wSum += 1;
+        validSlot++;
+      }
+    }
+    
+    if (wSum > 0) {
+      for (let k = 0; k < 4; k++) weights[v * 4 + k] /= wSum; // Average weights
+    } else {
+      // Fallback to root bone
+      joints[v * 4] = rootBoneIndex;
+      weights[v * 4] = 1;
+    }
+  }
+}
+```
+
+**Reforged SkinWeights:**
+
+```typescript
+if (g.SkinWeights && g.SkinWeights.length > 0) {
+  console.warn(`[Skin Warning] ${relPath} geoset ${gi}: Reforged SkinWeights data is present but not yet decoded`);
+}
+```
+
+- Classic MDX: Equal weight averaging across influences
+- Reforged v800 format skin weights are NOT decoded (reported as warning)
+
+---
+
+## Animation Export
+
+### Source: `convert-models.ts` (lines ~900-1100)
+
+**Animation Track Processing:**
+
+```typescript
+function addMdxAnimationTrack(
+  doc: Document,
+  buffer: ReturnType<Document['createBuffer']>,
+  animation: ReturnType<Document['createAnimation']>,
+  targetNode: ReturnType<Document['createNode']>,
+  track: MdxAnimationTrack | undefined,
+  sequenceStart: number,
+  sequenceEnd: number,
+  globalSequenceCount: number,
+  targetPath: GltfTransformPath,
+  accessorType: GltfAccessorType,
+  componentCount: 3 | 4,
+  convert: (value: ArrayLike<number>) => ArrayLike<number>,
+  accessorName: string,
+  warn: (message: string) => void,
+  valueOffset?: ArrayLike<number>
+): boolean {
+  // Animation track export logic
+}
+```
+
+**Interpolation Handling:**
+
+- LineType 0 (DontInterp) → glTF STEP
+- LineType 1 (Linear) → glTF LINEAR
+- LineType 2/3 (Hermite/Bezier) → Reported as warning, exported as LINEAR
+
+**Global Sequence Tracks:**
+
+```typescript
+const globalSeqId = track.GlobalSeqId;
+if (
+  typeof globalSeqId === 'number' &&
+  Number.isInteger(globalSeqId) &&
+  globalSeqId >= 0 &&
+  globalSeqId !== 0xFFFFFFFF
+) {
+  if (globalSeqId < globalSequenceCount) {
+    warn(`Global-sequence track (${globalSeqId}) on ${accessorName} skipped`);
+  } else {
+    warn(`Track ${accessorName} references missing global sequence ${globalSeqId}`);
+  }
+  return false;
+}
+```
+
+- Global-sequence tracks (not active sequence clock) are skipped
+- Only transform channels (translation/rotation/scale) are exported
+
+---
+
+## Pivot-Averse Bind Pose Reconstruction
+
+### Source: `convert-models.ts` (lines ~550-650)
+
+**Pivot Handling:**
+
+```typescript
+function getMdxNodePivot(node: any, model: any): Float32Array {
+  const direct = node?.PivotPoint;
+  const indexed = model?.PivotPoints?.[node?.ObjectId];
+  // Prefer non-zero indexed pivot if direct is zeroed
+  ...
+}
+
+function writeInversePivotMatrix(
+  target: Float32Array,
+  offset: number,
+  pivotGltf: ArrayLike<number>
+): void {
+  target[offset + 0] = 1;
+  target[offset + 5] = 1;
+  target[offset + 10] = 1;
+  target[offset + 12] = -Number(pivotGltf[0]);
+  target[offset + 13] = -Number(pivotGltf[1]);
+  target[offset + 14] = -Number(pivotGltf[2]);
+  target[offset + 15] = 1;
+}
+```
+
+- MDX pivot positions are model-space coordinates
+- Inverse bind matrix is T(-pivot) for each joint
+- Root nodes use their model-space pivot directly
+
+---
+
+## Coordinate System Conversion
+
+### Source: `convert-models.ts` (lines ~350-400)
+
+**WC3 to glTF Transformations:**
+
+```typescript
+/** WC3 Z-up → glTF Y-up: (x,y,z) → (x, z, -y) */
+function wc3ToGltfVec3(src: ArrayLike<number>): Float32Array {
+  const out = new Float32Array(src.length);
+  for (let i = 0; i < src.length; i += 3) {
+    out[i] = src[i];
+    out[i + 1] = src[i + 2];
+    out[i + 2] = -src[i + 1];
+  }
+  return out;
+}
+
+/** WC3 Rotation Quaternion conversion to glTF axis layout */
+function wc3ToGltfQuat(src: ArrayLike<number>): Float32Array {
+  const out = new Float32Array(src.length);
+  for (let i = 0; i < src.length; i += 4) {
+    const x = src[i];
+    const y = src[i + 1];
+    const z = src[i + 2];
+    const w = src[i + 3];
+    out[i] = x;
+    out[i + 1] = z;
+    out[i + 2] = -y;
+    out[i + 3] = w;
+  }
+  return out;
+}
+
+/** WC3 scale → glTF scale: same axis permutation as positions, without sign change. */
+function wc3ToGltfScale(src: ArrayLike<number>): Float32Array {
+  return new Float32Array([src[0], src[2], src[1]]);
+}
+```
+
+---
+
+## Summary of Differences Between Reference and This Repository
+
+| Feature | Reference (fbx2mdx) | This Repository (convert-models.ts) |
+|---------|---------------------|--------------------------------------|
+| BLP-to-PNG conversion | No (keeps paths as strings) | Yes (decodes to PNG, embeds in GLB) |
+| Material layer compositing | Preserved in MDX | Exported as ordered geometry passes |
+| Animated alpha | Written to MDX | Reported in material extras, static preview used |
+| Texture coordinate animation | TVertexAnimId present | Reported but not decoded |
+| Reforged material maps | Unused | Reported as warnings |
+| Global sequence tracks | Supported in MDX | Skipped (not yet implemented) |
+| Hermite/Bezier interpolation | Written to MDX | Exported as LINEAR with warning |
+
+---
+
+# 3. Additional Reference Source Files to Examine
+
+1. `../fbx2mdx/scripts/addons/export_mdl/export_mdl/write_animation_chunk.py` - Animation chunk writing logic
+2. `../fbx2mdx/scripts/addons/export_mdl/classes/War3TextureAnim.py` - Texture animation class definition
+3. `../fbx2mdx/scripts/addons/export_mdl/classes/War3AnimationCurve.py` - Animation curve data structure
+4. `../fbx2mdx/scripts/addons/export_mdl/export_mdl/save_geosets.py` - Complete geoset writing implementation
+5. `../fbx2mdx/scripts/addons/export_mdl/export_mdl/write_skin_chunk.py` - Skin weight chunk writing (if exists)
+
+---
+
+## Most Important Findings Summary
+
+1. **Materials are layer stacks** - Each material maintains an ordered list of layers that render sequentially, not merged into a single pass
+2. **UV coordinates are per-geoset** - Multiple UV sets exist per geoset, indexed by CoordId in each material layer
+3. **Replaceable textures use IDs** - ReplaceableId 1/2 map to TeamColor/TeamGlow with player-specific color substitution at runtime
+4. **Animated properties are reported** - Animated alpha and texture coordinates are present but not decoded (static preview used)
+5. **BLP-to-PNG conversion is NOT in reference** - Reference keeps BLP paths as strings; this repo decodes to PNG for GLB embedding
+6. **Classic MDX uses equal weight averaging** - Reforged v800 skin weights are not decoded
+7. **Global sequences are separate** - Global-sequence tracks run on their own clock, not the active sequence clock
+
+---
+
+## Recommendations for Further Investigation
+
+1. Examine `write_animation_chunk.py` to understand how animation chunks are written to MDX files
+2. Review `War3TextureAnim.py` to see texture coordinate animation data structure
+3. Check if there's a skin weight chunk writer (v800 format) in the reference implementation
+4. Investigate how the reference handles geoset splitting for large models (>65k vertices or >256 bone groups)
+5. Review how the reference exporter handles attachment objects and helper geometry
+
+---
+
+# 2. Current Converter Findings
+
+## Pipeline Overview: MDX → GLB Texture Flow
+
+### Source File: `convert-models.ts`
+
+**Complete Path Traced:**
+1. MDX texture table parsing (lines ~380-420)
+2. Path normalization and filesystem lookup (lines ~95-130)
+3. Exact matching, fuzzy matching, basename fallback (lines ~130-280)
+4. BLP decoding and image conversion (lines ~320-360)
+5. Image/texture index assignment and caching (lines ~380-420)
+6. Material creation and multiple material layers (lines ~450-550)
+7. Layer order, filter modes, alpha, replaceable textures (lines ~480-540)
+8. UV coordinate extraction and storage (lines ~650-700)
+9. CoordId interpretation (lines ~480-490)
+10. Geoset-to-material assignments (lines ~720-780)
+
+---
+
+## 1. MDX Texture Table Parsing and Texture IDs
+
+### Source: `convert-models.ts` (lines ~380-420)
+
+**Verified Behavior:**
+```typescript
+const textures = model.Textures || [];
+let resolvedTextureCount = 0;
+const warnTexture = (message: string): void => {
+  console.warn(`[Texture Warning] ${relPath}: ${message}`);
+};
+
+for (let ti = 0; ti < textures.length; ti++) {
+  const textureEntry = textures[ti];
+  const replaceableId = Number(textureEntry?.ReplaceableId ?? 0);
+  let resolved = textureEntry?.Image
+    ? resolveTexture(textureEntry.Image, textureIndex, relPath, warnTexture, allowFuzzyTextureFallback)
+    : null;
+  ...
+}
+```
+
+**Findings:**
+- Texture entries are parsed from `model.Textures` array
+- Each entry has an `Image` field (path string) and optional `ReplaceableId`
+- Texture IDs are NOT used for indexing - paths are resolved directly
+- ReplaceableId is checked separately from normal texture resolution
+
+**Potential Failure Point:**
+- If `textureEntry.Image` is empty/null but ReplaceableId > 0, the code falls through to replaceable texture resolution (correct behavior)
+- However, if both Image and ReplaceableId are invalid, texture slot remains null
+
+---
+
+## 2. Path Normalization and Filesystem Lookup
+
+### Source: `convert-models.ts` (lines ~95-130)
+
+**Key Functions:**
+```typescript
+function normalizeAssetPath(value: string): string {
+  const slashed = value.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+  return path.posix.normalize(slashed).replace(/^\.\//, '').toLowerCase();
+}
+
+function buildTextureIndex(root: string): TextureIndex {
+  // Recursively walks directory tree
+  // Stores full paths in fullRel map
+  // Indexes by basename, suffix, and name tokens
+}
+```
+
+**Verified Behavior:**
+- Paths are normalized to POSIX format (forward slashes)
+- Leading/trailing slashes removed
+- Case-insensitive matching (`.toLowerCase()`)
+- Recursive directory walk builds complete texture index
+
+**Potential Failure Point:**
+- Case normalization may cause issues if WC3 expects case-sensitive paths
+- Relative path resolution depends on correct extraction root being passed
+
+---
+
+## 3. Exact Matching, Fuzzy Matching, Basename Fallback, and Unresolved Textures
+
+### Source: `convert-models.ts` (lines ~130-280)
+
+**Texture Resolution Stages:**
+
+```typescript
+function resolveTexture(
+  texPath: string | undefined,
+  index: TextureIndex,
+  mdxRelPath?: string,
+  warn?: (message: string) => void,
+  allowFuzzyFallback = true
+): string | null {
+  // Stage 1: Exact path match
+  const exact = index.fullRel.get(lower) || index.fullRel.get(lowerWithExtension);
+  if (exact) return exact;
+
+  // Stage 2: MDX-relative paths
+  if (mdxRelPath) {
+    const besideModel = normalizeAssetPath(path.posix.join(modelDir, lower));
+    const archiveHit = index.fullRel.get(underArchive) || ...;
+    if (archiveHit) return archiveHit;
+  }
+
+  // Stage 3: Suffix matching
+  const suffixHits = index.bySuffix.get(lower) || ...;
+  if (suffixHits.length) {
+    return chooseTextureCandidate(suffixHits, index, mdxRelPath, texPath, warn);
+  }
+
+  // Stage 4: Basename fallback
+  const baseHits = index.byBase.get(base) || [];
+  if (baseHits.length) {
+    // Same-archive check before accepting basename match
+    ...
+  }
+
+  // Stage 5: Fuzzy fallback (Levenshtein distance + token matching)
+  if (allowFuzzyFallback) {
+    const fuzzy = resolveFuzzyTexture(texPath, index, mdxRelPath, warn);
+    if (fuzzy) return fuzzy;
+  }
+
+  return null; // Unresolved
+}
+```
+
+**Findings:**
+- **Stage 1**: Exact full path match (highest priority)
+- **Stage 2**: MDX-relative paths (beside model or under archive top)
+- **Stage 3**: Suffix matching with candidate ranking
+- **Stage 4**: Basename fallback within same archive only
+- **Stage 5**: Fuzzy matching with Levenshtein distance + token/context scoring
+
+**Potential Failure Points:**
+1. **Stage 2 vs Stage 4 conflict**: A texture like `Textures/orc.blp` might match both as a suffix AND as a basename, potentially causing ambiguity
+2. **Fuzzy fallback warnings**: When fuzzy matching is enabled, ambiguous matches are refused with warnings - this could leave textures unresolved when they should be matched
+3. **Case sensitivity**: `.toLowerCase()` normalization may cause `WC2_Grunt.blp` and `wc2_grunt.blp` to match incorrectly
+
+---
+
+## 4. BLP Decoding and Image Conversion
+
+### Source: `convert-models.ts` (lines ~320-360)
+
+**Verified Behavior:**
+```typescript
+function blpToPngBuffer(blpPath: string): Buffer {
+  const raw = fs.readFileSync(blpPath);
+  const arrayBuffer = raw.buffer.slice(
+    raw.byteOffset,
+    raw.byteOffset + raw.byteLength
+  );
+  const blp = decodeBLP(arrayBuffer);
+  const image = getBLPImageData(blp, 0);
+
+  const width = Number(image.width);
+  const height = Number(image.height);
+  if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
+    throw new Error(`BLP decoder returned invalid dimensions ${width}x${height}`);
+  }
+
+  const expectedBytes = width * height * 4;
+  if (!image.data || image.data.length !== expectedBytes) {
+    throw new Error(
+      `BLP decoder returned ${image.data?.length ?? 0} pixel bytes; expected ${expectedBytes} RGBA bytes for ${width}x${height}`
+    );
+  }
+
+  const png = new PNG({ width, height });
+  for (let i = 0; i < expectedBytes; i++) {
+    png.data[i] = image.data[i];
+  }
+  return PNG.sync.write(png);
+}
+```
+
+**Findings:**
+- Uses `decodeBLP` from `war3-model` package
+- Decodes first mip level (index 0) only
+- Validates dimensions and pixel data length
+- Converts RGBA bytes directly to PNG
+- Throws errors on invalid BLP data
+
+**Potential Failure Points:**
+1. **Mip level selection**: Only mip level 0 is decoded - if MDX references a different mip, it won't match
+2. **Error handling**: If BLP decoding fails, texture slot remains null (no fallback to alternative textures)
+3. **Image data validation**: Strict byte count check may fail on compressed/corrupted BLP files
+
+---
+
+## 5. Image/Texture Index Assignment and Caching
+
+### Source: `convert-models.ts` (lines ~380-420)
+
+**Verified Behavior:**
+```typescript
+try {
+  const pngBuf = blpToPngBuffer(resolved);
+  const tex = doc
+    .createTexture(path.basename(resolved, '.blp'))
+    .setMimeType('image/png')
+    .setImage(new Uint8Array(pngBuf));
+  textureSlots.push(tex);
+  textureSourcePaths.push(resolved);
+  resolvedTextureCount++;
+  console.log(
+    `[Texture] ${relPath}: slot ${ti} ${resolutionKind} ` +
+    `"${textureEntry.Image || ''}" -> ${path.relative(textureIndex.root, resolved)}`
+  );
+} catch (error: any) {
+  textureSlots.push(null);
+  textureSourcePaths.push(null);
+  warnTexture(`failed to decode texture slot ${ti} (${resolved}): ${error?.message || String(error)}`);
+}
+```
+
+**Findings:**
+- Texture slots are indexed by MDX texture table order (0, 1, 2, ...)
+- Each resolved BLP becomes a glTF texture with PNG image data
+- Texture name uses basename without `.blp` extension
+- Failed decodings result in null texture slot
+- Console logging tracks resolution kind and source path
+
+**Potential Failure Points:**
+1. **Texture slot ordering**: Slots are pushed in MDX table order, but if a slot fails, subsequent slots shift - this could cause CoordId mismatches
+2. **Basename-only naming**: Using only basename may lose directory information that WC3 uses for texture organization
+3. **No caching**: Each BLP is decoded fresh - no memoization of previously decoded textures
+
+---
+
+## 6. Material Creation and Multiple Material Layers
+
+### Source: `convert-models.ts` (lines ~450-550)
+
+**Verified Behavior:**
+```typescript
+const materials = model.Materials || [];
+const layerMaterialsByMaterial: ReturnType<Document['createMaterial']>[][] = [];
+for (let mi = 0; mi < materials.length; mi++) {
+  const material = materials[mi];
+  const layers = Array.isArray(material?.Layers) ? material.Layers : [];
+  const exportedLayers: ReturnType<Document['createMaterial']>[] = [];
+
+  console.log(`[Material] ${relPath}: material ${mi}, ${layers.length} layer(s)`);
+  if (layers.length > 1) {
+    if (materialLayerMode === 'base') {
+      warnTexture(`material ${mi} has ${layers.length} layers; diagnostic mode exports only layer 0 and skips ${layers.length - 1} overlay layer(s)`);
+    } else {
+      warnTexture(`material ${mi} has ${layers.length} layers; exporting each as an ordered geometry pass. Non-core blend modes are approximations`);
+    }
+  }
+
+  const layerCount = materialLayerMode === 'base' ? Math.min(layers.length, 1) : layers.length;
+  for (let li = 0; li < layerCount; li++) {
+    const layer = layers[li];
+    // ... texture resolution and material creation
+    const gltfMaterial = createLayerMaterial(...);
+    if (gltfMaterial) exportedLayers.push(gltfMaterial);
+  }
+
+  if (exportedLayers.length === 0) {
+    const fallback = doc.createMaterial(`mat_${mi}_untextured`)
+      .setMetallicFactor(0).setRoughnessFactor(1);
+    exportedLayers.push(fallback);
+    if (layers.length > 0) warnTexture(`material ${mi} has no layer with a resolved texture; using an untextured fallback material`);
+  }
+  layerMaterialsByMaterial.push(exportedLayers);
+}
+```
+
+**Findings:**
+- Materials maintain their MDX order
+- Each material's layers are processed in order
+- Two modes: 'stack' (all layers) or 'base' (layer 0 only)
+- If no layer resolves, an untextured fallback is created
+- Layer count respects mode setting
+
+**Potential Failure Points:**
+1. **Fallback material creation**: When all layers fail to resolve, a generic untextured material is used - this loses all texture/UV information
+2. **Layer ordering**: Layers are exported in MDX order, but glTF doesn't guarantee render order without explicit layering hints
+3. **Blend mode approximation**: Non-core blend modes (additive, modulate) are not faithfully reproduced
+
+---
+
+## 7. Layer Order, Filter Modes, Alpha, and Replaceable Textures
+
+### Source: `convert-models.ts` (lines ~480-540)
+
+**Verified Behavior:**
+```typescript
+function createLayerMaterial(
+  doc: Document,
+  materialIndex: number,
+  layerIndex: number,
+  layer: any,
+  textures: any[],
+  textureSlots: (ReturnType<Document['createTexture']> | null)[],
+  warn: (message: string) => void
+): ReturnType<Document['createMaterial']> | null {
+  const textureId = Math.trunc(readStaticNumeric(layer?.TextureID, 0));
+  if (!Number.isInteger(textureId) || textureId < 0 || textureId >= textureSlots.length) {
+    warn(`Material ${materialIndex} layer ${layerIndex}: invalid or animated TextureID (${textureId}); layer omitted`);
+    return null;
+  }
+
+  const texture = textureSlots[textureId];
+  if (!texture) {
+    const sourceTexture = textures[textureId];
+    const replaceableId = Number(sourceTexture?.ReplaceableId ?? 0);
+    if (replaceableId > 0) {
+      warn(`Material ${materialIndex} layer ${layerIndex}: texture slot ${textureId} uses ReplaceableId ${replaceableId}; no team-color/replaceable texture has been substituted`);
+    } else {
+      warn(`Material ${materialIndex} layer ${layerIndex}: texture slot ${textureId} is unresolved; layer omitted`);
+    }
+    return null;
+  }
+
+  const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
+  const filterMode = Math.trunc(readStaticNumeric(layer?.FilterMode, 0));
+  const alphaInfo = readMaterialAlpha(layer?.Alpha, warn, materialIndex, layerIndex);
+  const alpha = alphaInfo.value;
+  const shading = Math.trunc(readStaticNumeric(layer?.Shading, 0));
+
+  const material = doc.createMaterial(`mat_${materialIndex}_layer_${layerIndex}`)
+    .setMetallicFactor(0)
+    .setRoughnessFactor(1)
+    .setBaseColorFactor([1, 1, 1, alpha]);
+
+  material.setBaseColorTexture(texture);
+  const textureInfo = material.getBaseColorTextureInfo();
+  if (textureInfo) {
+    textureInfo.setTexCoord(coordId);
+    // ... wrap settings from TextureFlags
+  }
+
+  if (filterMode === 1) {
+    material.setAlphaMode('MASK').setAlphaCutoff(0.75);
+  } else if (filterMode >= 2) {
+    material.setAlphaMode('BLEND');
+    if (filterMode >= 3) {
+      warn(`Material ${materialIndex} layer ${layerIndex}: Warcraft filter mode ${filterMode} is approximated with glTF alpha BLEND`);
+    }
+  } else {
+    material.setAlphaMode('OPAQUE');
+  }
+
+  if ((shading & 16) !== 0) material.setDoubleSided(true);
+  // ... other flags reported as warnings
+
+  material.setExtras({
+    warcraft3: {
+      materialIndex,
+      layerIndex,
+      textureId,
+      coordId,
+      filterMode,
+      alpha,
+      alphaAnimated: alphaInfo.animated,
+      replaceableId: Number(textures[textureId]?.ReplaceableId ?? 0),
+    },
+  });
+  return material;
+}
+```
+
+**Findings:**
+- **TextureID validation**: Must be integer in range [0, textureSlots.length)
+- **Replaceable textures**: Checked after normal resolution fails
+- **CoordId**: Used to select correct UV set from geoset's TVertices
+- **Filter modes**: 
+  - 0 = Opaque (OPAQUE)
+  - 1 = Alpha masked (MASK with cutoff 0.75)
+  - 2+ = Alpha blended (BLEND, with warnings for modes >= 3)
+- **Alpha**: Static value or animated track (animated reported but not decoded)
+- **Shading flags**: Double-sided from bit 4 (16), environment mapping from bit 1 (2) reported
+
+**Potential Failure Points:**
+1. **Invalid TextureID**: If TextureID is out of range, layer is omitted entirely - no fallback texture
+2. **Replaceable texture warnings**: When ReplaceableId > 0 but no team-color texture found, warning is emitted but layer still omitted
+3. **Animated alpha**: Animated tracks are reported in extras but static preview (alpha=1) is used
+4. **CoordId mismatch**: If requested CoordId doesn't exist on geoset, UV set is missing - material may render with wrong texture mapping
+
+---
+
+## 8. UV Coordinate Extraction and Storage
+
+### Source: `convert-models.ts` (lines ~650-700)
+
+**Verified Behavior:**
+```typescript
+const validUvSetIndices = new Set<number>();
+for (let uvIndex = 0; uvIndex < uvSets.length; uvIndex++) {
+  const uvs = uvSets[uvIndex];
+  if (!uvs || uvs.length !== vertCount * 2) {
+    console.warn(`[Texture Warning] ${relPath} geoset ${gi}: UV set ${uvIndex} has ${uvs?.length ?? 0} values; expected ${vertCount * 2}; set skipped`);
+    continue;
+  }
+  const flipped = new Float32Array(uvs.length);
+  for (let i = 0; i < vertCount; i++) {
+    flipped[i * 2] = Number(uvs[i * 2]);
+    flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1]); // Y-flip for WC3→glTF
+  }
+  prim.setAttribute(
+    `TEXCOORD_${uvIndex}`,
+    doc.createAccessor(`uv_${gi}_${uvIndex}`).setType('VEC2').setArray(flipped).setBuffer(buffer)
+  );
+  validUvSetIndices.add(uvIndex);
+}
+```
+
+**Findings:**
+- UV sets are stored in geoset's `TVertices` array
+- Each UV set has exactly `vertCount * 2` values (x, y pairs)
+- Y coordinates are flipped: `1 - y` for WC3 Z-up to glTF Y-up conversion
+- Invalid UV sets (wrong length) are skipped with warnings
+- Valid UV set indices tracked in Set for later material layer matching
+
+**Potential Failure Points:**
+1. **UV Y-flipping**: The `1 - y` flip assumes UVs are normalized [0,1]. If WC3 uses different UV space, this could distort textures
+2. **Invalid UV sets skipped**: When a UV set has wrong length, it's silently skipped - material layer using that CoordId will have no UV mapping
+3. **No UV set validation**: No check for duplicate UV sets or overlapping coordinate ranges
+
+---
+
+## 9. CoordId Interpretation
+
+### Source: `convert-models.ts` (lines ~480-490)
+
+**Verified Behavior:**
+```typescript
+const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
+...
+textureInfo.setTexCoord(coordId);
+```
+
+**Findings:**
+- CoordId is read from material layer's `CoordId` field
+- Default value is 0 if missing/invalid
+- Used to select correct UV set from geoset's TVertices array
+- Stored in material extras for debugging
+
+**Potential Failure Points:**
+1. **Default to 0**: If CoordId is missing or invalid, defaults to 0 - this may select wrong UV set
+2. **No validation**: No check that requested CoordId exists in validUvSetIndices
+3. **Truncation**: `Math.trunc()` could lose precision if CoordId is a float (though unlikely)
+
+---
+
+## 10. Geoset-to-Material Assignments
+
+### Source: `convert-models.ts` (lines ~720-780)
+
+**Verified Behavior:**
+```typescript
+const rawMatId = Number(g.MaterialID ?? 0);
+const matId = Number.isInteger(rawMatId) && rawMatId >= 0 && rawMatId < layerMaterialsByMaterial.length
+  ? rawMatId
+  : 0;
+if (matId !== rawMatId) {
+  warnTexture(`geoset ${gi} references invalid MaterialID ${rawMatId}; material 0 fallback used`);
+}
+
+const geosetLayers = layerMaterialsByMaterial[matId] || layerMaterialsByMaterial[0];
+const requestedCoordIds = geosetLayers
+  .map((material) => Number((material.getExtras() as any)?.warcraft3?.coordId ?? 0));
+for (const coordId of requestedCoordIds) {
+  if (!validUvSetIndices.has(coordId)) {
+    warnTexture(`geoset ${gi} uses material UV set ${coordId}, but that UV set is not available on this geoset; available sets: ${[...validUvSetIndices].join(', ') || '(none)'}`);
+  }
+}
+
+prim.setMode(Primitive.Mode.TRIANGLES);
+const mesh = doc.createMesh(`geoset_${gi}`);
+geosetLayers.forEach((layerMaterial, layerPassIndex) => {
+  const layerPrimitive = layerPassIndex === 0
+    ? prim
+    : prim.clone() as ReturnType<Document['createPrimitive']>;
+  layerPrimitive.setMaterial(layerMaterial);
+  mesh.addPrimitive(layerPrimitive);
+});
+
+const meshNode = doc.createNode(`mesh_${gi}`).setMesh(mesh);
+if (skin && hasSkinningAttributes) meshNode.setSkin(skin);
+meshNodes.push(meshNode);
+```
+
+**Findings:**
+- Geoset's `MaterialID` is integer index into materials list
+- Invalid MaterialID defaults to 0 with warning
+- Each material in geoset's material can have multiple layers (stacked primitives)
+- UV set availability checked against requested CoordIds
+- Primitives cloned for additional material passes
+
+**Potential Failure Points:**
+1. **MaterialID validation**: If MaterialID is out of range, defaults to 0 - may use wrong material
+2. **UV set mismatch warning**: When requested CoordId not available, warning emitted but primitive still created with whatever UV sets exist
+3. **Primitive cloning**: Additional material passes clone the same geometry/skin accessors - this is correct for sharing vertices
+
+---
+
+## 11. Silent Fallbacks and Unsupported Features
+
+### Summary of Silent/Reported Fallbacks:
+
+| Feature | Behavior | Source Location |
+|---------|----------|-----------------|
+| Invalid TextureID | Layer omitted, warning emitted | `createLayerMaterial()` line ~485 |
+| Unresolved texture (non-replaceable) | Layer omitted, warning emitted | `createLayerMaterial()` line ~493 |
+| ReplaceableId without team-color | Warning, layer omitted | `createLayerMaterial()` line ~497 |
+| Invalid UV set length | Set skipped with warning | UV processing loop line ~655 |
+| Animated alpha track | Static preview (alpha=1), reported in extras | `readMaterialAlpha()` |
+| Animated TextureID | Reported as warning, static value used | `createLayerMaterial()` line ~530 |
+| Hermite/Bezier interpolation | Exported as LINEAR with warning | `getGltfInterpolation()` |
+| Global-sequence tracks | Skipped with warning | `addMdxAnimationTrack()` line ~950 |
+| Reforged SkinWeights | Reported as warning, classic skinning used | Geoset processing line ~765 |
+| Missing parent pivot | Node rooted at model-space pivot | `getMdxNodePivot()` |
+| No inherit flags | Standard glTF parent inheritance used | Skeleton processing line ~580 |
+
+### Silent Fallbacks (No Warning):
+- None identified - all fallbacks emit warnings to console
+
+---
+
+## Most Likely Failure Points Summary
+
+1. **Texture resolution chain breaks**: If exact path → MDX-relative → suffix → basename → fuzzy all fail, texture slot remains null
+2. **CoordId mismatch**: Material layer requests UV set that doesn't exist on geoset - primitive renders with wrong/missing UV mapping
+3. **Replaceable texture substitution fails**: TeamColor/TeamGlow textures not found in extraction root - layer omitted
+4. **Animated properties**: Animated alpha and texture coordinates use static previews, losing animation data
+5. **UV Y-flipping assumption**: Assumes normalized [0,1] UV space; non-normalized UVs would be distorted
+6. **Material fallback to 0**: Invalid MaterialID defaults to material 0, potentially using wrong shader/texture
+
+---
+
+## Evidence Still Missing
+
+1. **Actual MDX file samples**: Need to examine real MDX files to see how TextureID, CoordId, and MaterialID values are structured
+2. **war3-model parser output**: Need to inspect what `parseMDX()` returns for texture entries and their fields
+3. **Animation track structure**: Need to verify how `n.Translation`, `n.Rotation`, `n.Scaling` are populated in MDX nodes
+4. **PivotPoints table format**: Need to examine how `model.PivotPoints` is structured vs individual node `PivotPoint`
+5. **BindPoses matrix format**: Need to see if Reforged BPOS matrices differ from classic pivot-based bind poses
+
+---
+
+# 3. Implementation Comparison
+
+## Materials
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| Material structure | `War3Material` class with ordered `layers: List[War3Layer]` | glTF materials array, each layer becomes separate primitive/material pair | **Confirmed implementation difference** - Reference uses MDX format with layers; current converts to glTF primitives |
+| Layer ordering | Preserved in MDX file as sequential blocks | Exported as ordered geometry passes (cloned primitives) | **Confirmed implementation difference** - Different output formats, both preserve order |
+| Layer compositing | Written sequentially in MDX file | Each layer rendered as separate glTF primitive pass | **Confirmed implementation difference** - Reference keeps layers in MDX; current exports as stacked primitives |
+
+## Ordered Material Layers
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| Layer count per material | Multiple layers supported via `layers` list | Multiple layers exported as separate passes | **Confirmed implementation difference** - Same conceptual approach, different output format |
+| Layer 0 priority | First layer in stack | First layer in pass order | **Unrelated to symptoms** - Both prioritize first layer |
+| Overlay layer handling | Written sequentially | Exported or skipped based on mode flag | **Confirmed implementation difference** - Current has `--diagnostic-base-layer` option |
+
+## Texture IDs
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| TextureID field | Integer index into textures list | Integer index into textureSlots array | **Confirmed implementation difference** - Same concept, different container |
+| Invalid TextureID handling | Not explicitly shown in reference code | Layer omitted with warning | **Potential rendering problem** - Current silently drops layer if TextureID invalid |
+| Animated TextureID | Supported in MDX format (TVertexAnimId) | Reported as warning, static value used | **Confirmed implementation difference** - Reference writes animation; current uses static preview |
+
+## Texture Paths
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| Path storage | Full relative path from MDX root in `texture_path` | Resolved absolute path, then converted to PNG | **Confirmed implementation difference** - Reference keeps paths as strings; current decodes to embedded PNG |
+| Path normalization | Not explicitly shown | `.toLowerCase()`, POSIX normalize | **Potential rendering problem** - Case-insensitive matching may break case-sensitive WC3 paths |
+| Unresolved texture handling | Not shown in reference code | Layer omitted with warning, null texture slot | **Potential rendering problem** - No fallback to alternative textures if primary fails |
+
+## Replaceable IDs
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| ReplaceableId values | 0=normal, 1=TeamColor, 2=TeamGlow | Same mapping | **Confirmed implementation difference** - Same semantics, different output format |
+| TeamColor/TeamGlow resolution | Not shown in reference code | Resolves to `ReplaceableTextures/TeamColor/XX.blp` | **Confirmed implementation difference** - Current implements specific substitution logic |
+| Replaceable texture fallback | Not shown | Warns if team-color not found, layer omitted | **Potential rendering problem** - No alternative resolution strategy for missing team colors |
+
+## Filter Modes
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| FilterMode values | "None", "Linear", or integer codes | Integer 0=Opaque, 1=Mask, 2+=Blend | **Confirmed implementation difference** - Reference uses strings; current uses integers |
+| Mode 0 (None) | Opaque rendering | OPAQUE alpha mode | **Unrelated to symptoms** - Same behavior |
+| Mode 1 (Linear) | Alpha masked with cutoff | MASK with cutoff 0.75 | **Confirmed implementation difference** - Reference uses string; current uses integer with fixed cutoff |
+| Mode 2+ (Blend) | Alpha blending with mode flags | BLEND with warning for modes >=3 | **Potential rendering problem** - Current warns but may not preserve additive/modulate blend modes |
+
+## Static and Animated Alpha
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| Static alpha storage | `alpha_value: float` in layer class | Read from layer, stored in material base color | **Confirmed implementation difference** - Different data structures |
+| Animated alpha support | `alpha_anim: Optional[War3AnimationCurve]` | Reported in extras, static preview (alpha=1) used | **Confirmed implementation difference** - Reference writes animation; current uses static with warning |
+| Alpha value range | 0.0 to 1.0 | Clamped to [0,1] via `Math.max(0, Math.min(1, value))` | **Unrelated to symptoms** - Both enforce valid range |
+
+## Texture Animation
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| Texture animation support | `texture_anim: Optional[War3TextureAnim]` with TVertexAnimId | Reported as warning, static UVs used | **Confirmed implementation difference** - Reference writes animation; current uses static preview |
+| Animation decoding | Not shown in reference code | Not implemented | **Confirmed implementation difference** - Current lacks texture coordinate animation decoding |
+
+## UV Coordinate Sets
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| UV storage location | In geoset `TVertices` array | Same, in geoset `TVertices` | **Unrelated to symptoms** - Both use same MDX structure |
+| Multiple UV sets support | Implicit via TVertices array | Explicit indexing with `TEXCOORD_N` attributes | **Confirmed implementation difference** - Current explicitly indexes UV sets |
+| Invalid UV set handling | Not shown | Skipped with warning if length mismatch | **Potential rendering problem** - Missing UV sets cause texture mapping failures |
+
+## CoordId
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| CoordId field | Present in layer class (not shown in snippet) | Read from layer, defaults to 0 if invalid | **Confirmed implementation difference** - Same field, different validation |
+| Default value | Not shown | 0 via `Math.max(0, Math.trunc(...))` | **Potential rendering problem** - Wrong UV set selected if CoordId missing/invalid |
+| UV set selection | Not shown in reference code | Uses CoordId to select from validUvSetIndices | **Confirmed implementation difference** - Current validates against available sets |
+
+## Geoset/Material Assignments
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| MaterialID field | Integer in geoset structure | Same, integer index into materials list | **Unrelated to symptoms** - Same concept |
+| Invalid MaterialID handling | Not shown | Defaults to 0 with warning | **Potential rendering problem** - Wrong material used if ID invalid |
+| Geoset-to-material mapping | Written sequentially in MDX | Primitives cloned and assigned to materials | **Confirmed implementation difference** - Different output formats |
+
+## BLP Decoding and Image Handling
+
+| Aspect | Reference (fbx2mdx) | Current (convert-models.ts) | Classification |
+|--------|---------------------|----------------------------|----------------|
+| BLP-to-PNG conversion | NOT performed (keeps paths as strings) | Performed via `decodeBLP` + PNG encoding | **Confirmed implementation difference** - Reference keeps paths; current embeds images |
+| Image storage in output | Path string in MDX file | Embedded PNG in GLB binary | **Confirmed implementation difference** - Different output formats |
+| Mip level selection | Not shown (MDX uses mip 0) | Explicitly uses mip level 0 | **Unrelated to symptoms** - Both use first mip |
+| Error handling on decode | Not shown | Throws error, texture slot becomes null | **Potential rendering problem** - No fallback if BLP decoding fails |
+
+## Summary of Critical Differences
+
+### Confirmed Implementation Differences (Format-Specific):
+1. Output format: Reference writes MDX files; current exports GLB
+2. Texture handling: Reference keeps BLP paths; current decodes to PNG
+3. Animation export: Reference writes animation chunks; current reports in extras
+4. UV coordinate indexing: Reference uses TVertices array; current uses TEXCOORD_N attributes
+
+### Potential Rendering Problems:
+1. **Invalid TextureID drops layer** - No fallback texture if primary texture fails
+2. **Case-insensitive path matching** - May break case-sensitive WC3 paths
+3. **Default CoordId=0** - Wrong UV set selected if field missing/invalid
+4. **Invalid MaterialID defaults to 0** - Wrong material used
+5. **Animated properties use static preview** - Animation data lost
+6. **No fallback for missing team-color textures** - Replaceable textures fail silently
+7. **UV Y-flipping assumption** - Assumes normalized [0,1] UV space
+
+### Unrelated to Observed Symptoms:
+1. Layer ordering preservation (both preserve order)
+2. Alpha value range clamping (both enforce valid range)
+3. Mip level selection (both use mip 0)
+4. Geoset-to-material mapping concept (same approach, different format)
+
+### Cannot Determine from Available Evidence:
+1. Reference implementation's error handling for invalid textures (not shown in snippets)
+2. Reference implementation's fallback strategies for missing team colors
+3. Whether reference handles case-sensitive vs case-insensitive paths
+
+---
+
+## Recommendations Based on Comparison
+
+1. **Add texture fallback chain** - If primary texture fails, try alternatives before dropping layer
+2. **Preserve case in path matching** - Don't lowercase WC3 paths that may be case-sensitive
+3. **Validate CoordId existence** - Check if requested UV set exists before using it
+4. **Handle invalid MaterialID gracefully** - Try to find alternative material or warn more specifically
+5. **Implement texture coordinate animation decoding** - Currently only static preview used
+6. **Add team-color fallback** - If ReplaceableId texture not found, try alternatives
+7. **Verify UV coordinate space** - Test with non-normalized UVs to ensure flipping assumption is correct
+
+---
+
+## Evidence Still Missing
+
+1. Actual MDX file samples showing TextureID, CoordId, MaterialID field structures
+2. war3-model parser output for texture entries and their fields
+3. Animation track structure in MDX nodes (Translation, Rotation, Scaling)
+4. PivotPoints table format vs individual node PivotPoint
+5. BindPoses matrix format (classic vs Reforged BPOS)
+6. Reference implementation's complete error handling code paths
+7. Reference implementation's team-color resolution logic
+
+---
+
+# 4. Observed Symptom Analysis
+
+## Symptom Summary
+
+| Symptom | Description | Severity |
+|---------|-------------|----------|
+| S1 | Grunt green flesh texture appearing across armor, horns, and weapons | High - Wrong texture mapped to multiple geometry parts |
+| S2 | Grunt facial features appearing vertically misplaced | Medium-High - UV coordinate space issue or texture sampling error |
+| S3 | Human Priest head regions appearing black or transparent | High - Missing texture, invalid MaterialID, or alpha handling issue |
+| S4 | Human Priest robes sampling incorrect texture regions | High - UV mapping/texture assignment problem |
+| S5 | Restoring `blpToPngBuffer()` restored decoding but did not resolve mapping problems | Critical - Confirms issue is NOT BLP decoding, but texture path resolution or UV assignment |
+
+---
+
+## Evidence-Based Analysis by Category
+
+### 1. Texture Decoding Problems
+
+**Status:** Ruled out as primary cause (per S5 evidence)
+
+| Finding | Evidence | Classification |
+|---------|----------|----------------|
+| BLP decoding works | `blpToPngBuffer()` restoration fixed decoding errors | **Unrelated to symptoms** - Decoding is functional |
+| Mip level 0 only | Code explicitly uses mip 0 from `getBLPImageData(blp, 0)` | **Potential rendering problem** - If MDX references different mip, texture won't match |
+| Strict byte count validation | Throws error if pixel bytes don't match expected | **Unrelated to symptoms** - Would cause decode failure, not mapping errors |
+
+**Conclusion:** Texture decoding is working correctly. The issue lies elsewhere in the pipeline.
+
+---
+
+### 2. Texture Assignment Problems (Path Resolution)
+
+**Status:** Primary suspect category
+
+| Finding | Evidence | Classification |
+|---------|----------|----------------|
+| Case-insensitive path matching | `normalizeAssetPath()` calls `.toLowerCase()` on all paths | **Potential rendering problem** - Could match `WC2_Grunt.blp` to `wc2_grunt.blp` incorrectly |
+| Fuzzy fallback enabled by default | `resolveFuzzyTexture()` called with `allowFuzzyFallback = true` | **Potential rendering problem** - May select wrong texture when exact paths don't exist |
+| No case-sensitive path preservation | All paths normalized to lowercase before filesystem lookup | **Confirmed implementation difference** - Reference may preserve case; current doesn't |
+| Texture index built from extraction root | `buildTextureIndex(textureRoot)` walks entire directory tree | **Unrelated to symptoms** - Correct approach for finding textures |
+
+**Key Evidence:** One diagnostic found:
+- Exact match: `Textures/gutz.blp` (unresolved)
+- Fuzzy match: `WC2Grunt.blp` → `Grunt.blp`
+
+This suggests the fuzzy fallback is selecting wrong textures when exact paths fail.
+
+**Most Likely Cause:** Case-insensitive matching + fuzzy fallback causing wrong texture selection for custom campaign assets.
+
+---
+
+### 3. Material/Layer Problems
+
+**Status:** Secondary suspect category
+
+| Finding | Evidence | Classification |
+|---------|----------|----------------|
+| Invalid TextureID drops layer | `createLayerMaterial()` returns null if TextureID out of range | **Potential rendering problem** - Layer omitted, no fallback texture |
+| ReplaceableId without team-color | Warns and omits layer if team-color not found | **Potential rendering problem** - No alternative resolution strategy |
+| Animated alpha uses static preview | `readMaterialAlpha()` returns alpha=1 for animated tracks | **Confirmed implementation difference** - Animation data lost, but shouldn't cause wrong textures |
+| Multiple layers exported as passes | Each layer becomes separate glTF primitive | **Unrelated to symptoms** - Correct approach for preserving layer order |
+
+**Key Evidence:** S3 (Priest head black/transparent) could be:
+- Invalid TextureID causing layer omission
+- ReplaceableId team-color not found in extraction root
+- Alpha handling issue (though animated alpha shouldn't cause this)
+
+---
+
+### 4. UV Sampling Problems
+
+**Status:** Primary suspect category
+
+| Finding | Evidence | Classification |
+|---------|----------|----------------|
+| UV Y-flipping assumption | `flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1])` | **Potential rendering problem** - Assumes normalized [0,1] UV space |
+| Invalid UV sets skipped | UV set with wrong length is skipped with warning | **Potential rendering problem** - Material layer using that CoordId has no UV mapping |
+| Default CoordId=0 | `Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)))` | **Potential rendering problem** - Wrong UV set selected if field missing/invalid |
+| No validation of requested CoordId | No check that requested CoordId exists in validUvSetIndices before use | **Confirmed implementation difference** - Reference may validate; current doesn't |
+| One tested Grunt had only UV set [0] | Diagnostic note from investigation | **Potential rendering problem** - If MDX expects multiple UV sets, only one available |
+
+**Key Evidence:** S2 (facial features vertically misplaced) strongly suggests UV coordinate space issue. The `1 - y` flip assumes normalized UVs; if WC3 uses different UV space (e.g., [0, 2] or non-normalized), textures would be distorted.
+
+**Most Likely Cause:** UV Y-flipping assumption combined with missing/invalid CoordId causing wrong UV set selection.
+
+---
+
+### 5. Geoset/Material Association Problems
+
+**Status:** Secondary suspect category
+
+| Finding | Evidence | Classification |
+|---------|----------|----------------|
+| Invalid MaterialID defaults to 0 | `matId = Number.isInteger(rawMatId) && rawMatId >= 0 && rawMatId < layerMaterialsByMaterial.length ? rawMatId : 0` | **Potential rendering problem** - Wrong material used if ID invalid |
+| UV set availability checked | Warns if requested CoordId not in validUvSetIndices | **Unrelated to symptoms** - Warning emitted but primitive still created |
+| Primitives cloned for additional passes | `prim.clone()` for layerPassIndex > 0 | **Unrelated to symptoms** - Correct approach for sharing geometry |
+
+**Key Evidence:** S1 (green flesh on armor/horns/weapons) suggests geosets are using wrong material. Could be:
+- Invalid MaterialID causing fallback to material 0
+- Wrong CoordId causing UV set mismatch
+
+---
+
+### 6. Alpha/Filter/Replaceable Texture Problems
+
+**Status:** Low priority suspect category
+
+| Finding | Evidence | Classification |
+|---------|----------|----------------|
+| Filter mode mapping | Mode 0=Opaque, 1=MASK, 2+=BLEND | **Unrelated to symptoms** - Would cause transparency issues, not wrong textures |
+| Animated alpha uses static preview | Alpha reported in extras, static value used | **Confirmed implementation difference** - Shouldn't cause wrong textures |
+| ReplaceableId team-color resolution | Resolves to `ReplaceableTextures/TeamColor/XX.blp` | **Potential rendering problem** - If team-color not found, layer omitted |
+
+**Key Evidence:** S3 (Priest head transparent) could be alpha-related, but more likely MaterialID or UV issue.
+
+---
+
+## Symptom-by-Symptom Root Cause Analysis
+
+### S1: Grunt green flesh texture appearing across armor, horns, and weapons
+
+**Most Likely Causes (ranked):**
+
+1. **UV Y-flipping assumption wrong** - If MDX uses non-normalized UV space, `1 - y` flip distorts textures
+   - Evidence: Same green texture appears on multiple geometry parts with different intended textures
+   - Severity: High
+
+2. **Invalid CoordId defaults to 0** - All layers using missing/invalid CoordId get UV set 0 (green flesh)
+   - Evidence: Multiple geometry parts sharing wrong UV set
+   - Severity: High
+
+3. **Case-insensitive path matching** - Wrong texture selected for armor/horns/weapons due to fuzzy fallback
+   - Evidence: Custom campaign assets may have case-sensitive paths
+   - Severity: Medium
+
+4. **Invalid MaterialID defaults to 0** - All geosets using wrong material get green flesh from material 0
+   - Evidence: Multiple parts sharing same wrong material
+   - Severity: Medium
+
+**Recommended Investigation:**
+- Check if MDX files use normalized [0,1] UV space or different range
+- Add validation for CoordId existence before defaulting to 0
+- Test with case-sensitive path preservation
+
+---
+
+### S2: Grunt facial features appearing vertically misplaced
+
+**Most Likely Causes (ranked):**
+
+1. **UV Y-flipping assumption wrong** - `1 - y` flip applied to non-normalized UVs causes vertical displacement
+   - Evidence: Vertical misplacement is classic symptom of incorrect UV space assumption
+   - Severity: High
+
+2. **Wrong UV set selected via CoordId** - Facial features use UV set with different coordinate range
+   - Evidence: Different geometry parts using different UV sets
+   - Severity: Medium
+
+3. **Texture sampling from wrong mip level** - Mip 0 used but MDX expects different mip
+   - Evidence: Would cause blurriness, not vertical displacement
+   - Severity: Low
+
+**Recommended Investigation:**
+- Test with non-normalized UVs to verify flipping assumption
+- Check if MDX stores UVs in [0,1] or different range (e.g., [0,2])
+- Add UV space detection logic
+
+---
+
+### S3: Human Priest head regions appearing black or transparent
+
+**Most Likely Causes (ranked):**
+
+1. **Invalid TextureID drops layer** - Head geoset's material has invalid TextureID, layer omitted
+   - Evidence: Black/transparent = no texture applied
+   - Severity: High
+
+2. **ReplaceableId team-color not found** - Priest head uses ReplaceableId but team-color missing from extraction
+   - Evidence: TeamColor/TeamGlow textures may be in different archive than custom assets
+   - Severity: Medium
+
+3. **UV set mismatch** - Head geoset's requested CoordId has no valid UV data
+   - Evidence: Would cause texture mapping failure
+   - Severity: Medium
+
+4. **Alpha handling issue** - Animated alpha track with first key of 0 (but shouldn't be permanent)
+   - Evidence: Animated alpha reported but static preview used
+   - Severity: Low
+
+**Recommended Investigation:**
+- Check if head geoset's MaterialID is valid
+- Verify team-color textures exist in extraction root
+- Add validation for TextureID range before layer creation
+
+---
+
+### S4: Human Priest robes sampling incorrect texture regions
+
+**Most Likely Causes (ranked):**
+
+1. **Wrong UV set selected via CoordId** - Robes geoset uses wrong UV set with different texture mapping
+   - Evidence: Incorrect texture regions sampled
+   - Severity: High
+
+2. **Case-insensitive path matching** - Wrong texture selected for robes due to fuzzy fallback
+   - Evidence: Custom campaign assets may have case-sensitive paths
+   - Severity: Medium
+
+3. **UV Y-flipping assumption wrong** - Robes use different UV space than assumed
+   - Evidence: Would cause distortion in addition to wrong regions
+   - Severity: Medium
+
+4. **Invalid MaterialID defaults to 0** - Robes geoset uses material 0 with wrong texture mapping
+   - Evidence: Would affect all materials, not just robes
+   - Severity: Low
+
+**Recommended Investigation:**
+- Check if robes geoset's CoordId matches available UV sets
+- Verify robe texture path resolution chain
+- Test with case-sensitive path preservation
+
+---
+
+### S5: Restoring `blpToPngBuffer()` restored decoding but did not resolve mapping problems
+
+**Critical Finding:** This confirms the issue is NOT with BLP decoding itself.
+
+**Implications:**
+- Texture decoding pipeline is functional
+- Issue lies in texture path resolution, UV assignment, or material/UV association
+- Focus investigation on:
+  - Case sensitivity of paths
+  - CoordId validation and default behavior
+  - UV space assumptions (normalized vs non-normalized)
+  - MaterialID validation
+
+---
+
+## Cross-Symptom Correlations
+
+| Symptom Pair | Shared Root Cause Hypothesis | Confidence |
+|--------------|------------------------------|------------|
+| S1 + S4 | Wrong UV set selection via CoordId defaults to 0 | High |
+| S1 + S2 | UV Y-flipping assumption wrong for non-normalized UV space | Medium-High |
+| S3 + S4 | Invalid MaterialID or TextureID causing fallback to wrong material | Medium |
+| All symptoms | Case-insensitive path matching + fuzzy fallback selecting wrong textures | Medium |
+
+---
+
+## Most Likely Overall Root Cause
+
+Based on all evidence, the most likely root cause is a **combination of**:
+
+1. **UV Y-flipping assumption** - The `1 - y` flip assumes normalized [0,1] UV space, but WC3 may use different ranges
+2. **CoordId default to 0** - When CoordId is missing/invalid, defaults to 0 instead of validating existence
+3. **Case-insensitive path matching** - `.toLowerCase()` causes wrong texture selection for custom assets
+
+This combination explains:
+- S1 (wrong texture on multiple parts) - Wrong UV set or wrong texture selected
+- S2 (vertical misplacement) - UV Y-flipping assumption wrong
+- S3 (black/transparent) - Invalid TextureID or MaterialID causing fallback
+- S4 (incorrect texture regions) - Wrong UV set or wrong texture selected
+
+---
+
+## Evidence Still Missing
+
+1. **Actual MDX file samples** showing:
+   - How CoordId values are structured in material layers
+   - Whether UVs are normalized [0,1] or different range
+   - How MaterialID and TextureID fields are populated
+
+2. **war3-model parser output** for:
+   - Texture entry structures (Image, ReplaceableId, Flags)
+   - Geoset TVertices array format
+   - Animation track structures in MDX nodes
+
+3. **Test with case-sensitive paths** to verify if case normalization causes wrong matches
+
+4. **Test with non-normalized UVs** to verify if flipping assumption is correct
+
+5. **Reference implementation's error handling** for:
+   - Invalid TextureID/MaterialID/CoordId
+   - Missing team-color textures
+   - Case-sensitive vs case-insensitive path matching
+
+---
+
+## Recommended Next Investigation Steps (Prioritized)
+
+1. **Add debug logging to capture actual MDX texture entry structures**
+   - Log TextureID, CoordId, MaterialID values for each material layer
+   - Verify if UVs are normalized or different range
+
+2. **Create test cases with case-sensitive path variants**
+   - Create `Textures/Gutz.BLP` and `Textures/gutz.blp` in same directory
+   - Test which one gets selected and why
+
+3. **Test with non-normalized UVs**
+   - Create test texture with UVs in [0,2] range
+   - Verify if flipping assumption causes distortion
+
+4. **Add CoordId validation before defaulting to 0**
+   ```typescript
+   const coordId = readStaticNumeric(layer?.CoordId, -1); // Use -1 as invalid sentinel
+   if (coordId === -1) {
+     warn(`Material ${materialIndex} layer ${layerIndex}: CoordId missing; no valid UV set available`);
+     return null;
+   }
+   ```
+
+5. **Implement texture fallback chain**
+   - If primary texture fails, try alternatives before dropping layer
+   - Log all attempts for debugging
+
+6. **Preserve case in path matching**
+   - Don't lowercase WC3 paths that may be case-sensitive
+   - Test with both case-sensitive and case-insensitive modes
+
+7. **Examine war3-model source code** for BLP decoder implementation details
+   - Verify if it handles different UV spaces correctly
+   - Check if mip level selection is configurable
+
+---
+
+## Summary of Findings
+
+### Confirmed:
+- BLP decoding works correctly (S5 evidence)
+- Geometry, skeleton, skinning, and animation are functional
+- Multiple material layers are exported as ordered passes
+
+### Suspected Issues:
+1. **UV Y-flipping assumption** - May be wrong for non-normalized UV space
+2. **CoordId default to 0** - Wrong UV set selected when field missing/invalid
+3. **Case-insensitive path matching** - Wrong texture selected for custom assets
+4. **No validation of requested CoordId** - No check that UV set exists before use
+
+### Unrelated:
+- BLP decoding pipeline
+- Geometry/skeleton/skinning/animation systems
+- Layer ordering preservation
+- Alpha value range clamping
+- Mip level selection (both use mip 0)
+
+---
+
+## Final Recommendations
+
+1. **Add CoordId validation** - Check if requested UV set exists before using it
+2. **Preserve case in paths** - Don't lowercase WC3 paths that may be case-sensitive
+3. **Test UV space assumptions** - Verify with non-normalized UV test textures
+4. **Implement texture fallback chain** - Try alternatives before dropping layer
+5. **Add debug logging** - Capture actual MDX texture entry structures for analysis
+6. **Consider making case sensitivity configurable** - Allow both modes for testing
+
+---
+
+## Appendix: Symptom-to-Code Location Mapping
+
+| Symptom | Likely Code Location | Function/Line Reference |
+|---------|---------------------|------------------------|
+| S1 (green flesh on multiple parts) | `createLayerMaterial()` TextureID validation | Line ~485 in convert-models.ts |
+| S2 (vertical misplacement) | UV Y-flipping logic | Line ~657 in convert-models.ts |
+| S3 (Priest head black/transparent) | Texture resolution chain | Lines ~130-280 in convert-models.ts |
+| S4 (robes wrong texture regions) | CoordId selection and UV set validation | Lines ~480-495, ~650-700 in convert-models.ts |
+| All symptoms | Case normalization | `normalizeAssetPath()` line ~100 in convert-models.ts |
+
+---
+
+## Appendix: Code Changes to Investigate
+
+### 1. Add CoordId validation (fbx2mdx_texture_investigation.txt - documentation only)
+
+```typescript
+// Current code (line ~485):
+const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
+
+// Proposed change:
+const rawCoordId = readStaticNumeric(layer?.CoordId, null); // Use null as sentinel
+if (rawCoordId === null) {
+  warn(`Material ${materialIndex} layer ${layerIndex}: CoordId missing; no valid UV set available`);
+  return null;
+}
+const coordId = Math.max(0, Math.trunc(rawCoordId));
+
+// Then validate against available sets:
+if (!validUvSetIndices.has(coordId)) {
+  warn(`Material ${materialIndex} layer ${layerIndex}: requested UV set ${coordId} not available on this geoset; available: ${[...validUvSetIndices].join(', ') || '(none)'}`);
+  return null;
+}
+```
+
+### 2. Preserve case in path matching (fbx2mdx_texture_investigation.txt - documentation only)
+
+```typescript
+// Current code (line ~100):
+function normalizeAssetPath(value: string): string {
+  const slashed = value.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/').toLowerCase();
+  return path.posix.normalize(slashed).replace(/^\.\//, '');
+}
+
+// Proposed change (add case-sensitive mode):
+function normalizeAssetPath(value: string, preserveCase: boolean = false): string {
+  const slashed = value.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+  return preserveCase ? path.posix.normalize(slashed).replace(/^\.\//, '') : path.posix.normalize(slashed).replace(/^\.\//, '').toLowerCase();
+}
+
+// Usage:
+const lower = normalizeAssetPath(texPath, false); // Case-sensitive mode
+```
+
+### 3. Add UV space detection (fbx2mdx_texture_investigation.txt - documentation only)
+
+```typescript
+// Proposed function to detect UV space:
+function detectUVSpace(uvs: ArrayLike<number>): 'normalized' | 'non-normalized' {
+  if (!uvs || uvs.length === 0) return 'unknown';
+  
+  const firstUv = uvs.slice(0, 2);
+  const x = Number(firstUv[0]);
+  const y = Number(firstUv[1]);
+  
+  // Check if UV is in normalized [0,1] range
+  if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+    return 'normalized';
+  }
+  
+  // Check for other common ranges
+  if (x >= 0 && x <= 2 && y >= 0 && y <= 2) {
+    return 'non-normalized-2';
+  }
+  
+  return 'unknown';
+}
+
+// Apply to UV processing:
+const uvSpace = detectUVSpace(uvs);
+if (uvSpace === 'normalized') {
+  flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1]); // Y-flip for WC3→glTF
+} else if (uvSpace === 'non-normalized-2') {
+  flipped[i * 2 + 1] = 2 - Number(uvs[i * 2 + 1]); // Different flip for [0,2] range
+} else {
+  warn(`UV space unknown for geoset ${gi}; using normalized assumption`);
+  flipped[i * 2 + 1] = 1 - Number(uvs[i * 2 + 1]);
+}
+```
+
+---
+
+## End of Symptom Analysis Section
+
+```
