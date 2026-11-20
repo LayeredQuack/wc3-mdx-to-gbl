@@ -6,8 +6,9 @@ import { Document, NodeIO, Primitive } from '@gltf-transform/core';
 
 /**
  * Stage 3 texture pass: path-aware BLP resolution, all MDX UV sets, material
- * CoordId selection, and ordered material-layer geometry passes. Warcraft blend
- * modes without a direct glTF equivalent are reported as approximations.
+ * CoordId selection, replaceable TeamColor/TeamGlow texture previews, and
+ * explicit animated-alpha diagnostics. Warcraft blend modes without a direct
+ * glTF equivalent are reported as approximations.
  */
 
 interface ConversionRecord {
@@ -72,6 +73,24 @@ interface TextureIndex {
   fullRel: Map<string, string>;
   byBase: Map<string, string[]>;
   bySuffix: Map<string, string[]>;
+  byNameToken: Map<string, string[]>;
+  allBlps: string[];
+}
+
+/**
+ * Tokenize a filename while retaining useful CamelCase boundaries.
+ * Examples: WC2Grunt.blp -> [grunt], WC2_Grunt.blp -> [grunt],
+ * Shockwave_Ice1.blp -> [shockwave, ice].
+ */
+function tokenizeAssetName(value: string): string[] {
+  const base = path.posix.basename(value.replace(/\\/g, '/'))
+    .replace(/\.(blp|mdx)$/i, '');
+  const separated = base
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
+    .replace(/([A-Za-z])([0-9])/g, '$1 $2')
+    .replace(/([0-9])([A-Za-z])/g, '$1 $2');
+  return [...new Set(separated.toLowerCase().split(/[^a-z0-9]+/).filter(token => token.length >= 3))];
 }
 
 function normalizeAssetPath(value: string): string {
@@ -83,6 +102,8 @@ function buildTextureIndex(root: string): TextureIndex {
   const fullRel = new Map<string, string>();
   const byBase = new Map<string, string[]>();
   const bySuffix = new Map<string, string[]>();
+  const byNameToken = new Map<string, string[]>();
+  const allBlps: string[] = [];
 
   function addToIndex(map: Map<string, string[]>, key: string, fullPath: string): void {
     const entries = map.get(key) || [];
@@ -108,7 +129,11 @@ function buildTextureIndex(root: string): TextureIndex {
 
       const rel = normalizeAssetPath(path.relative(root, full));
       fullRel.set(rel, full);
+      allBlps.push(full);
       addToIndex(byBase, path.posix.basename(rel), full);
+      for (const token of tokenizeAssetName(entry.name)) {
+        addToIndex(byNameToken, token, full);
+      }
 
       // Index every path suffix (e.g. "Textures/orc.blp" and "orc.blp").
       // This lets MDX texture references match archive paths without falling
@@ -121,7 +146,7 @@ function buildTextureIndex(root: string): TextureIndex {
   }
 
   walk(root);
-  return { root, fullRel, byBase, bySuffix };
+  return { root, fullRel, byBase, bySuffix, byNameToken, allBlps };
 }
 
 function rankTexturePath(assetPath: string): number {
@@ -180,11 +205,153 @@ function chooseTextureCandidate(
   return ranked[0].abs;
 }
 
+function normalizedTextureStem(value: string): string {
+  return path.posix.basename(normalizeAssetPath(value)).replace(/\.blp$/i, '').replace(/[^a-z0-9]/g, '');
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let previous = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const old = row[j];
+      row[j] = Math.min(
+        row[j] + 1,
+        row[j - 1] + 1,
+        previous + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      previous = old;
+    }
+  }
+  return row[b.length];
+}
+
+interface FuzzyTextureCandidate {
+  abs: string;
+  rel: string;
+  nameScore: number;
+  contextScore: number;
+  totalScore: number;
+  reason: string;
+}
+
+/**
+ * A conservative final fallback for legacy/custom assets whose MDX names a
+ * texture "WC2Grunt.blp" while the extracted file is called "Grunt.blp".
+ * This never silently picks among equally plausible atlases. For path-bearing
+ * references, the candidate must have a matching parent-directory suffix
+ * (e.g. Textures/...). This prevents accidental UI/effect texture matches.
+ */
+function resolveFuzzyTexture(
+  texPath: string,
+  index: TextureIndex,
+  mdxRelPath: string | undefined,
+  warn: (message: string) => void
+): string | null {
+  const requestedStem = normalizedTextureStem(texPath);
+  const requestedTokens = tokenizeAssetName(texPath);
+  if (requestedStem.length < 4 || requestedTokens.length === 0) return null;
+
+  const modelRel = normalizeAssetPath(mdxRelPath || '');
+  const modelParts = modelRel.split('/').filter(Boolean);
+  const modelDir = modelParts.length > 1 ? path.posix.dirname(modelRel) : '.';
+  const modelTop = modelParts.length > 1 ? modelParts[0] : '';
+  const modelTokens = tokenizeAssetName(mdxRelPath || '');
+  const requestedDir = path.posix.dirname(normalizeAssetPath(texPath));
+  const hasRequestedDir = requestedDir !== '.' && requestedDir !== '';
+
+  const pool = new Set<string>();
+  for (const token of requestedTokens) {
+    for (const candidate of index.byNameToken.get(token) || []) pool.add(candidate);
+  }
+  // Model-name tokens provide context, but are not sufficient on their own to
+  // create a match. A candidate must still be lexically close to the MDX slot.
+
+  const ranked: FuzzyTextureCandidate[] = [];
+  for (const abs of pool) {
+    const filename = path.basename(abs);
+    const candidateStem = normalizedTextureStem(filename);
+    if (candidateStem.length < 4) continue;
+
+    let nameScore = 0;
+    let reason = '';
+    if (candidateStem === requestedStem) {
+      nameScore = 100;
+      reason = 'normalized filename equality';
+    } else if (requestedTokens.includes(candidateStem)) {
+      nameScore = 94;
+      reason = `filename equals requested token "${candidateStem}"`;
+    } else if (requestedStem.endsWith(candidateStem) || requestedStem.startsWith(candidateStem)) {
+      // Handles WC2Grunt -> Grunt without accepting arbitrary shared substrings.
+      nameScore = 90 + Math.min(4, Math.floor((candidateStem.length / requestedStem.length) * 4));
+      reason = 'filename is a complete prefix/suffix of requested texture name';
+    } else {
+      const distance = levenshteinDistance(requestedStem, candidateStem);
+      const maxLength = Math.max(requestedStem.length, candidateStem.length);
+      const similarity = 1 - distance / maxLength;
+      if (similarity >= 0.84 && Math.min(requestedStem.length, candidateStem.length) >= 6) {
+        nameScore = 78 + Math.round((similarity - 0.84) * 100);
+        reason = `similar filename (${Math.round(similarity * 100)}% normalized similarity)`;
+      }
+    }
+    if (nameScore < 78) continue;
+
+    const rel = normalizeAssetPath(path.relative(index.root, abs));
+    const candidateDir = path.posix.dirname(rel);
+    const candidateTop = rel.split('/')[0] || '';
+    const sameDirectory = candidateDir === modelDir;
+    const sameTop = !!modelTop && candidateTop === modelTop;
+    const commonPrefix = modelDir === '.' ? 0 : commonPathPrefixLength(modelDir, candidateDir);
+
+    // Do not let a path such as Textures/Shockwave_Ice1.blp resolve to an
+    // unrelated UI/Glues/.../Shockwave_Ice1.blp merely by filename.
+    const candidateDirParts = candidateDir.split('/').filter(Boolean);
+    const requestedDirParts = requestedDir.split('/').filter(Boolean);
+    const hasMatchingRequestedDirSuffix = requestedDirParts.length > 0 &&
+      requestedDirParts.length <= candidateDirParts.length &&
+      requestedDirParts.every((part, i) =>
+        part === candidateDirParts[candidateDirParts.length - requestedDirParts.length + i]
+      );
+    if (hasRequestedDir && !hasMatchingRequestedDirSuffix) continue;
+
+    let contextScore = 0;
+    if (sameDirectory) contextScore += 40;
+    if (sameTop) contextScore += 24;
+    if (hasMatchingRequestedDirSuffix) contextScore += 20;
+    contextScore += Math.min(12, commonPrefix * 3);
+    const candidateTokens = tokenizeAssetName(filename);
+    if (candidateTokens.some(token => modelTokens.includes(token))) contextScore += 5;
+
+    ranked.push({ abs, rel, nameScore, contextScore, totalScore: nameScore + contextScore, reason });
+  }
+
+  if (ranked.length === 0) return null;
+  ranked.sort((a, b) => b.totalScore - a.totalScore || b.nameScore - a.nameScore || a.rel.localeCompare(b.rel));
+
+  if (ranked.length > 1) {
+    const first = ranked[0];
+    const second = ranked[1];
+    const sameStrength = first.nameScore === second.nameScore &&
+      Math.abs(first.contextScore - second.contextScore) < 10;
+    const insufficientMargin = first.totalScore - second.totalScore < 10;
+    if (sameStrength || insufficientMargin) {
+      warn(`Fuzzy texture match for "${texPath}" is ambiguous; refusing to guess. Best candidates: ${ranked.slice(0, 6).map(c => `${c.rel} (name=${c.nameScore}, context=${c.contextScore})`).join('; ')}`);
+      return null;
+    }
+  }
+
+  const selected = ranked[0];
+  warn(`FUZZY MATCH: "${texPath}" -> "${selected.rel}" (${selected.reason}; name=${selected.nameScore}, context=${selected.contextScore}). Verify that this is the correct atlas, not merely a similarly named texture.`);
+  return selected.abs;
+}
+
 function resolveTexture(
   texPath: string | undefined,
   index: TextureIndex,
   mdxRelPath?: string,
-  warn: (message: string) => void = (message) => console.warn(`[Texture Warning] ${message}`)
+  warn: (message: string) => void = (message) => console.warn(`[Texture Warning] ${message}`),
+  allowFuzzyFallback = true
 ): string | null {
   if (!texPath || !texPath.trim()) return null;
   const lower = normalizeAssetPath(texPath);
@@ -215,13 +382,40 @@ function resolveTexture(
     return chooseTextureCandidate(suffixHits, index, mdxRelPath, texPath, warn);
   }
 
-  // 4. Last resort: basename match. Warn whenever the name is not unique.
+  // 4. Exact-basename fallback. Path-bearing references remain protected from
+  // unrelated same-name files in other branches of the extraction.
   const baseHits = index.byBase.get(base) || [];
   if (baseHits.length) {
-    if (baseHits.length > 1) {
-      warn(`Texture "${texPath}" had no path match and ${baseHits.length} basename matches; applying archive/model proximity ranking`);
+    const sameArchiveHits = baseHits.filter((candidate) => {
+      const rel = normalizeAssetPath(path.relative(index.root, candidate));
+      return modelTop !== '' && rel.split('/')[0] === modelTop;
+    });
+
+    if (sameArchiveHits.length === 1) {
+      const selected = sameArchiveHits[0];
+      warn(`Texture "${texPath}" had no full path match; using the only same-archive filename match "${normalizeAssetPath(path.relative(index.root, selected))}"`);
+      return selected;
     }
-    return chooseTextureCandidate(baseHits, index, mdxRelPath, texPath, warn);
+
+    if (!lower.includes('/') && baseHits.length === 1) return baseHits[0];
+
+    if (lower.includes('/')) {
+      const examples = baseHits.slice(0, 5).map((candidate) =>
+        normalizeAssetPath(path.relative(index.root, candidate))
+      );
+      warn(`No safe exact-basename match for path-bearing texture "${texPath}"; ${baseHits.length} filename candidate(s) exist${examples.length ? `: ${examples.join(', ')}` : ''}`);
+    } else if (sameArchiveHits.length > 1) {
+      warn(`Ambiguous bare texture reference "${texPath}": ${sameArchiveHits.length} filename matches exist in archive "${modelTop}"; trying conservative fuzzy/context matching`);
+    } else {
+      warn(`Ambiguous bare texture reference "${texPath}": ${baseHits.length} filename matches exist outside archive "${modelTop}"; trying conservative fuzzy/context matching`);
+    }
+  }
+
+  // 5. Fuzzy filename fallback (e.g. WC2Grunt.blp -> Grunt.blp). This is
+  // deliberately last and always emits a warning naming the chosen BLP.
+  if (allowFuzzyFallback) {
+    const fuzzy = resolveFuzzyTexture(texPath, index, mdxRelPath, warn);
+    if (fuzzy) return fuzzy;
   }
 
   return null;
@@ -273,6 +467,77 @@ function readStaticNumeric(value: any, fallback: number): number {
     : fallback;
 }
 
+/**
+ * Resolve MDX replaceable texture slots to an extracted Warcraft III texture.
+ * ReplaceableId 1 is TeamColor; ReplaceableId 2 is TeamGlow. The selected
+ * index is a deliberate static preview choice (default 00/red), because the
+ * runtime game normally chooses this from the owning player's color.
+ */
+function resolveReplaceableTexture(
+  replaceableId: number,
+  teamColorIndex: number,
+  index: TextureIndex,
+  mdxRelPath: string,
+  warn: (message: string) => void
+): string | null {
+  const kind = replaceableId === 1 ? 'TeamColor' : replaceableId === 2 ? 'TeamGlow' : null;
+  if (!kind) {
+    warn(`unsupported ReplaceableId ${replaceableId}; no static replacement rule is defined`);
+    return null;
+  }
+
+  const suffix = `${kind}${String(teamColorIndex).padStart(2, '0')}.blp`;
+  const canonicalPath = `ReplaceableTextures/${kind}/${suffix}`;
+  const resolved = resolveTexture(canonicalPath, index, mdxRelPath, warn);
+  if (!resolved) {
+    warn(`ReplaceableId ${replaceableId} requires ${canonicalPath}, but that texture was not found in the extraction root`);
+  }
+  return resolved;
+}
+
+/**
+ * Do not mistake an animated KMTA Alpha track's first key for a static value.
+ * Stage 3 has no material-animation channel export yet, so animated alpha is
+ * held at 1 for the static Blender texture/material preview. Literal numeric
+ * alpha values are preserved exactly. The animated track is reported and
+ * retained in material extras for later material-animation work.
+ */
+function readMaterialAlpha(
+  value: any,
+  warn: (message: string) => void,
+  materialIndex: number,
+  layerIndex: number
+): { value: number; animated: boolean; keyCount: number; firstKey?: number } {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return { value: Math.max(0, Math.min(1, value)), animated: false, keyCount: 0 };
+  }
+
+  if (value && Array.isArray(value.Keys)) {
+    const first = value.Keys[0]?.Vector?.[0];
+    warn(`Material ${materialIndex} layer ${layerIndex}: Alpha is an animated track (${value.Keys.length} key(s)); material animation is not exported yet, so static preview alpha is set to 1 instead of sampling the first key`);
+    return {
+      value: 1,
+      animated: true,
+      keyCount: value.Keys.length,
+      firstKey: typeof first === 'number' ? first : undefined,
+    };
+  }
+
+  return { value: 1, animated: false, keyCount: 0 };
+}
+
+function describeMaterialAlpha(value: any): string {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `static ${value}`;
+  }
+  if (value && Array.isArray(value.Keys)) {
+    const first = value.Keys[0]?.Vector?.[0];
+    const global = typeof value.GlobalSeqId === 'number' ? `, GlobalSeqId=${value.GlobalSeqId}` : '';
+    return `animated track (${value.Keys.length} key(s)${global}, first=${typeof first === 'number' ? first : 'n/a'})`;
+  }
+  return 'default 1';
+}
+
 function createLayerMaterial(
   doc: Document,
   materialIndex: number,
@@ -302,7 +567,8 @@ function createLayerMaterial(
 
   const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
   const filterMode = Math.trunc(readStaticNumeric(layer?.FilterMode, 0));
-  const alpha = Math.max(0, Math.min(1, readStaticNumeric(layer?.Alpha, 1)));
+  const alphaInfo = readMaterialAlpha(layer?.Alpha, warn, materialIndex, layerIndex);
+  const alpha = alphaInfo.value;
   const shading = Math.trunc(readStaticNumeric(layer?.Shading, 0));
   const material = doc.createMaterial(`mat_${materialIndex}_layer_${layerIndex}`)
     .setMetallicFactor(0)
@@ -357,6 +623,10 @@ function createLayerMaterial(
       textureId,
       coordId,
       filterMode,
+      alpha,
+      alphaAnimated: alphaInfo.animated,
+      alphaKeyCount: alphaInfo.keyCount,
+      alphaFirstKey: alphaInfo.firstKey ?? null,
       replaceableId: Number(textures[textureId]?.ReplaceableId ?? 0),
     },
   });
@@ -653,7 +923,15 @@ function getFilesRecursive(dir: string, ext: string, fileList: string[] = []): s
 }
 
 // ── Standalone Conversion Pipeline ────────────────────────────────────────
-async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: TextureIndex, outDir: string): Promise<string> {
+async function convertOne(
+  mdxAbsPath: string,
+  relPath: string,
+  textureIndex: TextureIndex,
+  outDir: string,
+  materialLayerMode: 'stack' | 'base',
+  teamColorIndex: number,
+  allowFuzzyTextureFallback: boolean
+): Promise<string> {
   const buf = fs.readFileSync(mdxAbsPath);
   const model = parseMDX(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
 
@@ -662,6 +940,7 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
 
   // Textures — resolve paths conservatively and preserve replaceable-texture diagnostics.
   const textureSlots: (ReturnType<Document['createTexture']> | null)[] = [];
+  const textureSourcePaths: (string | null)[] = [];
   const textures = model.Textures || [];
   let resolvedTextureCount = 0;
   const warnTexture = (message: string): void => {
@@ -670,14 +949,25 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
 
   for (let ti = 0; ti < textures.length; ti++) {
     const textureEntry = textures[ti];
-    const resolved = resolveTexture(textureEntry.Image, textureIndex, relPath, warnTexture);
+    const replaceableId = Number(textureEntry?.ReplaceableId ?? 0);
+    let resolved = textureEntry?.Image
+      ? resolveTexture(textureEntry.Image, textureIndex, relPath, warnTexture, allowFuzzyTextureFallback)
+      : null;
+    let resolutionKind = 'image path';
+
+    // Replaceable textures have an empty Image by design. Resolve IDs 1/2 to
+    // the extracted team-color/team-glow variants for this static preview.
+    if (!resolved && replaceableId > 0) {
+      resolved = resolveReplaceableTexture(
+        replaceableId, teamColorIndex, textureIndex, relPath, warnTexture
+      );
+      resolutionKind = `ReplaceableId ${replaceableId} (preview index ${teamColorIndex})`;
+    }
 
     if (!resolved) {
       textureSlots.push(null);
-      const replaceableId = Number(textureEntry?.ReplaceableId ?? 0);
-      if (replaceableId > 0) {
-        warnTexture(`texture slot ${ti} has ReplaceableId ${replaceableId} (image="${textureEntry.Image || ''}"); no replacement texture assigned`);
-      } else if (textureEntry?.Image) {
+      textureSourcePaths.push(null);
+      if (replaceableId <= 0 && textureEntry?.Image) {
         warnTexture(`texture slot ${ti} could not resolve "${textureEntry.Image}"`);
       }
       continue;
@@ -690,10 +980,15 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
         .setMimeType('image/png')
         .setImage(new Uint8Array(pngBuf));
       textureSlots.push(tex);
+      textureSourcePaths.push(resolved);
       resolvedTextureCount++;
-      console.log(`[Texture] ${relPath}: slot ${ti} "${textureEntry.Image}" -> ${path.relative(textureIndex.root, resolved)}`);
+      console.log(
+        `[Texture] ${relPath}: slot ${ti} ${resolutionKind} ` +
+        `"${textureEntry.Image || ''}" -> ${path.relative(textureIndex.root, resolved)}`
+      );
     } catch (error: any) {
       textureSlots.push(null);
+      textureSourcePaths.push(null);
       warnTexture(`failed to decode texture slot ${ti} (${resolved}): ${error?.message || String(error)}`);
     }
   }
@@ -711,19 +1006,30 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
 
     console.log(`[Material] ${relPath}: material ${mi}, ${layers.length} layer(s)`);
     if (layers.length > 1) {
-      warnTexture(`material ${mi} has ${layers.length} layers; exporting each as an ordered geometry pass. Non-core blend modes are approximations`);
+      if (materialLayerMode === 'base') {
+        warnTexture(`material ${mi} has ${layers.length} layers; diagnostic mode exports only layer 0 and skips ${layers.length - 1} overlay layer(s)`);
+      } else {
+        warnTexture(`material ${mi} has ${layers.length} layers; exporting each as an ordered geometry pass. Non-core blend modes are approximations`);
+      }
     }
 
-    for (let li = 0; li < layers.length; li++) {
+    // Diagnostic mode isolates UV/texture assignment from MDX layer compositing.
+    // Warcraft's material layers are a blend stack, not independent opaque copies
+    // of the geoset. The full stack remains available for comparison, but should
+    // not be treated as a faithful final implementation until compositing is baked.
+    const layerCount = materialLayerMode === 'base' ? Math.min(layers.length, 1) : layers.length;
+    for (let li = 0; li < layerCount; li++) {
       const layer = layers[li];
       const textureId = Math.trunc(readStaticNumeric(layer?.TextureID, 0));
       const coordId = Math.max(0, Math.trunc(readStaticNumeric(layer?.CoordId, 0)));
       const filterMode = Math.trunc(readStaticNumeric(layer?.FilterMode, 0));
       const sourceTexture = textures[textureId];
       console.log(
-        `[Material]   layer ${li}: TextureID=${textureId}, image="${sourceTexture?.Image || ''}", ` +
+        `[Material] ${relPath}: material ${mi} layer ${li}: TextureID=${textureId}, ` +
+        `image="${sourceTexture?.Image || ''}", ` +
+        `resolved="${textureSourcePaths[textureId] ? path.relative(textureIndex.root, textureSourcePaths[textureId]!) : '(unresolved/replaceable)'}", ` +
         `ReplaceableId=${Number(sourceTexture?.ReplaceableId ?? 0)}, CoordId=${coordId}, ` +
-        `FilterMode=${filterMode}, Alpha=${readStaticNumeric(layer?.Alpha, 1)}`
+        `FilterMode=${filterMode}, Alpha=${describeMaterialAlpha(layer?.Alpha)}`
       );
 
       const gltfMaterial = createLayerMaterial(
@@ -1116,18 +1422,46 @@ async function convertOne(mdxAbsPath: string, relPath: string, textureIndex: Tex
 
 // ── Main Execution ──────────────────────────────────────────────────────────
 async function runStandaloneConversion() {
-  // Usage: npx tsx convert-models.ts [input-directory] [--output output-directory]
-  // The positional input folder and --output option keep the configurable
-  // directory behavior used by the current repository version.
+  // Usage: npx tsx convert-models.ts [model-input-directory] [--texture-root BLP-search-root] [--output output-directory]
+  // Fuzzy texture matching is a last-resort fallback; use --strict-texture-matching to disable it.
+  // Add --diagnostic-base-layer to export only material layer 0. This isolates
+  // base texture/UV assignment from multi-layer compositing while preserving the
+  // default full-layer export for comparison.
   const args = process.argv.slice(2);
   let inputDirArg = './wc3_extracts';
   let outputDirArg = 'converted-glb';
+  let textureRootArg: string | null = null;
+  let materialLayerMode: 'stack' | 'base' = 'stack';
+  // Static replacement choice for model previews. Warcraft normally selects
+  // this from the owning player at runtime; 0 is the classic red preview.
+  let teamColorIndex = 0;
+  let allowFuzzyTextureFallback = true;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--output' && i + 1 < args.length) {
       outputDirArg = args[++i];
+    } else if (arg === '--texture-root' && i + 1 < args.length) {
+      textureRootArg = args[++i];
+    } else if (arg.startsWith('--texture-root=')) {
+      textureRootArg = arg.substring('--texture-root='.length);
     } else if (arg.startsWith('--output=')) {
       outputDirArg = arg.substring('--output='.length);
+    } else if (arg === '--diagnostic-base-layer') {
+      materialLayerMode = 'base';
+    } else if (arg === '--strict-texture-matching') {
+      allowFuzzyTextureFallback = false;
+    } else if (arg === '--team-color-index' && i + 1 < args.length) {
+      const parsed = Number.parseInt(args[++i], 10);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 23) {
+        teamColorIndex = parsed;
+      } else {
+        console.warn(`[Arguments] Invalid --team-color-index; expected 0..23, received ${args[i]}. Using 0.`);
+        teamColorIndex = 0;
+      }
+    } else if (arg.startsWith('--team-color-index=')) {
+      const parsed = Number.parseInt(arg.substring('--team-color-index='.length), 10);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 23) teamColorIndex = parsed;
+      else console.warn(`[Arguments] Invalid --team-color-index; using 0.`);
     } else if (!arg.startsWith('-')) {
       inputDirArg = arg;
     }
@@ -1135,6 +1469,7 @@ async function runStandaloneConversion() {
 
   const inputDir = path.resolve(inputDirArg);
   const outputDir = path.resolve(outputDirArg);
+  const textureRoot = path.resolve(textureRootArg || inputDir);
   const reporter = new ModelConversionReporter();
 
   if (!fs.existsSync(inputDir)) {
@@ -1142,12 +1477,23 @@ async function runStandaloneConversion() {
     return;
   }
 
+  if (!fs.existsSync(textureRoot) || !fs.statSync(textureRoot).isDirectory()) {
+    console.error(`Texture search root does not exist or is not a directory: ${textureRoot}`);
+    return;
+  }
+
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  console.log('Indexing BLP textures...');
-  const textureIndex = buildTextureIndex(inputDir);
+  console.log(`Material export mode: ${materialLayerMode === 'base' ? 'diagnostic base-layer only' : 'full layer stack (approximate)'}`);
+  console.log(`Replaceable texture preview: team color index ${teamColorIndex} (TeamColor/TeamGlow)`);
+  console.log(`Fuzzy texture fallback: ${allowFuzzyTextureFallback ? 'enabled (ambiguous matches are refused)' : 'disabled (--strict-texture-matching)'}`);
+  console.log('Indexing BLP textures recursively...');
+  console.log(`Model input directory: ${inputDir}`);
+  console.log(`Texture search root: ${textureRoot}`);
+  const textureIndex = buildTextureIndex(textureRoot);
+  console.log(`Indexed ${textureIndex.allBlps.length} BLP file(s) across ${textureRoot}`);
 
   console.log(`Scanning for .mdx files in: ${inputDir}...`);
   const mdxFiles = getFilesRecursive(inputDir, '.mdx');
@@ -1158,7 +1504,7 @@ async function runStandaloneConversion() {
     const relPath = path.relative(inputDir, filePath);
 
     try {
-      const glbPath = await convertOne(filePath, relPath, textureIndex, outputDir);
+      const glbPath = await convertOne(filePath, relPath, textureIndex, outputDir, materialLayerMode, teamColorIndex, allowFuzzyTextureFallback);
       const stats = fs.statSync(glbPath);
       reporter.logSuccess(path.relative(outputDir, glbPath), stats.size);
     } catch (err: any) {
