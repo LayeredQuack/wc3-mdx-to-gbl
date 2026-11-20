@@ -1,0 +1,625 @@
+# Warcraft III MDX → GLB: Reference Implementation Audit and Reverse-Conversion Analysis
+
+You are running inside a Docker container with the host directory `~/Documents/code` mounted at `/app`.
+
+The local repositories are already available to you:
+
+- `/app/fbx2mdx` — reference project: FBX → Warcraft III MDX.
+- `/app/wc3-mdx-to-gbl` — my project: Warcraft III MDX → GLB.
+
+Your task is to investigate the reference implementation, inspect my existing converter, and produce a detailed, evidence-based reverse-engineering audit and implementation checklist.
+
+The purpose is to understand how the FBX → MDX implementation constructs Warcraft III models and use that knowledge to improve the reverse MDX → GLB conversion.
+
+**This is an investigation and documentation task. Do not modify either converter.**
+
+---
+
+# Phase 0 — Verify local repository access
+
+Start by executing actual filesystem commands.
+
+Print:
+
+- Current working directory.
+- Absolute paths of both repositories.
+- Whether each directory exists.
+- Whether each directory is a Git repository.
+- Git working-tree status for both projects.
+
+For example:
+
+```bash
+pwd -P
+
+for dir in fbx2mdx wc3-mdx-to-gbl; do
+  echo "===== $dir ====="
+  if [ -d "/app/$dir" ]; then
+    realpath "/app/$dir"
+    ls -la "/app/$dir" | head -40
+  else
+    echo "NOT FOUND: /app/$dir"
+  fi
+done
+
+git -C /app/fbx2mdx rev-parse --show-toplevel 2>&1
+git -C /app/wc3-mdx-to-gbl rev-parse --show-toplevel 2>&1
+
+git -C /app/fbx2mdx status --short 2>&1
+git -C /app/wc3-mdx-to-gbl status --short 2>&1
+```
+
+If a directory is not at the expected path, search only the immediate `/app` directory and identify its actual location.
+
+Do not stop merely because `/app` itself is not a Git repository. The individual project directories may be separate Git repositories.
+
+**Do not claim that files are unavailable until you have executed these checks and verified the result.**
+
+Record the initial Git status so that we can verify later that no source files were modified.
+
+# Phase 1 — Understand the reference repository
+
+Investigate `/app/fbx2mdx`.
+
+First, inspect:
+
+- README and documentation.
+- Main executable or entry-point script.
+- `convert.py`.
+- Blender import/export integration.
+- `scripts/addons/export_mdl/` or equivalent exporter implementation.
+- MDL serialization.
+- MDX generation, including `mdl2mdx.js`.
+- Texture processing.
+- Geometry processing.
+- Skeleton and skinning processing.
+- Animation processing.
+- Tests and validation tools.
+- Dependencies and bundled third-party code.
+
+Discover the actual repository structure before assuming filenames or function names.
+
+Produce a pipeline diagram and explain the actual execution sequence from input model to final MDX.
+
+For every stage, identify:
+
+1. The source file.
+2. The relevant function or class.
+3. What data enters that stage.
+4. What transformations take place.
+5. What data leaves that stage.
+6. Whether the operation is reversible.
+7. Any information discarded or approximated.
+
+Distinguish between:
+
+- Confirmed behavior in source code.
+- Claims made by README or documentation.
+- Inferences based on code structure.
+- Behavior that could not be verified.
+
+Do not invent functions, filenames, or implementation details.
+
+# Phase 2 — Detailed investigation of the Python exporter and MDX conversion pipeline
+
+The `fbx2mdx` project is Python-based, so prioritize direct source-code analysis rather than external reverse-engineering tools.
+
+Pay particular attention to:
+
+- `convert.py`
+- `scripts/addons/export_mdl/`
+- The Blender MDL importer and exporter modules.
+- Blender-specific mesh, material, armature, and animation conversion code.
+- The JavaScript `mdl2mdx.js` stage.
+- Any additional scripts involved in the conversion process.
+
+Trace the data all the way through:
+
+**Blender data → Python exporter → MDL text representation → MDX binary representation.**
+
+For each feature, identify which stage is responsible for encoding it.
+
+Specifically investigate:
+
+1. How Blender mesh data becomes MDL geosets.
+2. How Blender UV maps become MDL texture-coordinate arrays.
+3. How Blender material slots become MDL materials and layers.
+4. How texture paths and replaceable textures are serialized.
+5. How Blender armatures and vertex groups become MDL nodes and skinning data.
+6. How animation actions become MDL animation sequences and tracks.
+7. How MDL text is parsed and converted into MDX binary structures.
+8. Which features are lost or simplified at each stage.
+
+**Important:** Do not assume that the Python exporter and JavaScript MDL-to-MDX converter have identical responsibilities. Investigate each independently.
+
+Where possible, identify the exact point at which information is discarded, approximated, or converted into a Warcraft-specific representation.
+
+Do not use REA, Ghidra, or external reverse-engineering tools for this task. The available Python and JavaScript source code is the primary evidence.
+
+# Phase 3 — Geometry and coordinate systems
+
+Investigate:
+
+- Vertex positions.
+- Coordinate system conversions.
+- Scale conversions.
+- Model orientation and forward direction.
+- Origin and pivot handling.
+- Triangle indices and winding order.
+- Geoset creation and splitting.
+- Vertex normals.
+- Tangents, if supported.
+- Vertex groups.
+- Vertex duplication.
+- Mesh optimization.
+- Maximum vertices and other Warcraft III limits.
+- Any data discarded during mesh conversion.
+
+Explain how the reference implementation represents these concepts in MDL/MDX.
+
+For MDX → GLB, identify the equivalent GLB representation and any conversion steps that must be inverted or reconstructed.
+
+Identify any differences between Blender's coordinate conventions, Warcraft III's coordinate conventions, and glTF's coordinate conventions.
+
+Do not assume that coordinate conversions can simply be reversed without considering pivots, transforms, and hierarchy.
+
+# Phase 4 — UV coordinates and textures
+
+Investigate:
+
+- UV coordinates and UV sets.
+- UV indexing.
+- Texture image references.
+- Texture paths.
+- BLP conversion or handling.
+- Material-layer creation.
+- Multiple texture layers.
+- Texture-coordinate IDs.
+- Texture animations.
+- Animated alpha.
+- Filter modes.
+- Alpha blending.
+- Replaceable textures.
+- Team color.
+- Team glow.
+- Texture wrapping.
+- Missing texture behavior.
+- Texture path conventions.
+
+Determine exactly how the reference exporter serializes texture and material information.
+
+Do not assume that an operation can be inverted merely because it looks like a simple coordinate or image transformation.
+
+Pay special attention to how texture-coordinate arrays are associated with geosets and how material layers select their texture-coordinate sets.
+
+Determine whether the exporter preserves multiple UV maps or simplifies them.
+
+Investigate whether texture images are embedded, referenced externally, converted, or left untouched.
+
+Explain the difference between the reference project's texture handling and what an MDX → GLB converter needs to do when reading existing BLP textures.
+
+# Phase 5 — Materials
+
+Investigate the complete material pipeline:
+
+- Material creation.
+- Material IDs.
+- Geoset material assignments.
+- Material layers.
+- Layer ordering.
+- Texture IDs.
+- Filter modes.
+- Alpha values and animation tracks.
+- Replaceable IDs.
+- Shader or rendering assumptions.
+- Any limitations of MDL/MDX material serialization.
+
+Explain which features have direct GLB equivalents and which require approximation, metadata, or custom handling.
+
+Do not assume that a Warcraft material can be represented faithfully by a single glTF PBR material.
+
+Investigate whether multiple MDX material layers are composited, represented independently, or require a custom shader or other approximation.
+
+# Phase 6 — Skeletons and skinning
+
+Investigate:
+
+- Bone creation.
+- Bone hierarchy.
+- Node relationships.
+- Pivot points.
+- Bind pose.
+- Inverse bind matrices.
+- Vertex groups.
+- Skin weights.
+- Bone influence limits.
+- Maximum bone groups.
+- Vertex-to-bone mapping.
+- Skinning format limitations.
+- Bone naming and ID assignment.
+- Helper nodes and attachments.
+- Any assumptions made by the exporter.
+
+Pay special attention to lossy skinning operations.
+
+For example, determine whether the exporter:
+
+- Averages weights.
+- Removes weak bone influences.
+- Limits the number of influences per vertex.
+- Splits geosets to satisfy bone-group limits.
+- Discards information that cannot be recovered from the resulting MDX.
+
+Explain the implications for an MDX → GLB importer.
+
+Determine whether the MDX format contains enough information to reconstruct the final skinning data without the original Blender project.
+
+# Phase 7 — Animation
+
+Investigate:
+
+- Animation sequence names.
+- Sequence start and end frames.
+- Looping behavior.
+- Translation tracks.
+- Rotation tracks.
+- Scaling tracks.
+- Interpolation modes.
+- Linear interpolation.
+- Hermite interpolation.
+- Bezier interpolation.
+- Global sequences.
+- Node animation.
+- Root motion.
+- Animation frame rates and time conversion.
+- How multiple actions are handled.
+- How unnamed actions are handled.
+- How animation tracks are sampled or baked.
+- Any animation data that is dropped.
+
+Determine exactly what the exporter preserves and what it approximates.
+
+For MDX → GLB, explain which animation features should become native glTF animation channels and which require baking, extensions, or special treatment.
+
+# Phase 8 — Warcraft-specific functionality
+
+Investigate how the reference implementation handles:
+
+- Attachments.
+- Helpers.
+- Collision shapes.
+- Event objects.
+- Particle emitters.
+- Ribbons.
+- Lights.
+- Cameras.
+- Team-color functionality.
+- Team-glow functionality.
+- Replaceable textures.
+- Warcraft-specific material features.
+- Any special node types.
+
+Identify which features are representable in standard GLB and which cannot be preserved without additional metadata or custom extensions.
+
+# Phase 9 — Identify lossy operations and mathematical reversibility
+
+Create a dedicated analysis of all operations that lose information.
+
+For each operation, classify it as one of:
+
+- **Reversible:** The original data can be reconstructed mathematically.
+- **Reversible with conditions:** The original data can be reconstructed only if additional information is retained.
+- **Approximate:** The result can be approximated, but the original values cannot be recovered exactly.
+- **Irreversible:** Information is permanently discarded.
+- **Warcraft-specific:** The information has no direct standard GLB equivalent.
+- **Exporter limitation:** The reference project does not preserve a feature even though the format may support it.
+
+Examples to investigate include:
+
+- Weight averaging.
+- Bone influence cutoff.
+- Influence count limits.
+- Animation baking.
+- Interpolation simplification.
+- Geoset splitting.
+- Vertex duplication.
+- Texture conversion.
+- Coordinate conversion.
+- Scale normalization.
+- Root-motion removal.
+
+Do not assume that reversing an exporter operation is the correct solution.
+
+Where an operation is lossy, identify whether the MDX file contains enough information to reconstruct the original Warcraft data without the original FBX.
+
+# Phase 10 — Analyze validation and tests
+
+Inspect all relevant tests and validation tools, especially:
+
+- `tests/check.sh`
+- `tests/verify_anim.py`
+- `mdxinfo.py`
+
+Verify their actual filenames and locations before using them.
+
+For each test, explain:
+
+1. What it executes.
+2. What input it uses.
+3. What output it checks.
+4. What correctness criteria it applies.
+5. What errors it can detect.
+6. What errors it cannot detect.
+
+Pay particular attention to whether the animation test compares actual deformed vertex positions or merely checks whether animation data exists.
+
+Recommend equivalent tests for MDX → GLB.
+
+The recommendations should include tests for:
+
+- Geometry position preservation.
+- Vertex and triangle counts.
+- UV preservation.
+- Material and texture assignment.
+- Texture appearance.
+- Skeleton hierarchy.
+- Bind pose.
+- Skin weights.
+- Animation channel creation.
+- Animation playback.
+- Per-frame deformed vertex comparison.
+- Multiple animation sequences.
+- Warcraft-specific data preservation.
+
+Where practical, describe how to compare the original MDX data against data extracted from the resulting GLB.
+
+Do not modify existing tests.
+
+Run only tests that are already available, safe, and do not overwrite project files. If a test requires unavailable dependencies, document that limitation rather than installing or modifying anything.
+
+# Phase 11 — Audit my MDX → GLB converter
+
+Now inspect `/app/wc3-mdx-to-gbl`.
+
+Do not assume the filenames or implementation are identical to previous versions of the project.
+
+Discover and inspect the actual current files, including where present:
+
+- `convert-models.ts`
+- `convert-models-stage3-diagnostic-v4.ts`
+- `package.json`
+- Relevant dependencies.
+- Existing diagnostic scripts.
+- Tests.
+- Existing documentation.
+
+Focus on the actual implementation, not just the names of the files.
+
+The converter already has substantial working functionality. Preserve the following known-good behavior as a constraint for future recommendations.
+
+## Working animation behavior
+
+Animation tracks are read from `AnimVector.Keys`, with keyframe values in each key's `Frame` and `Vector` fields.
+
+Translation, rotation, and scaling tracks are exported as glTF animation channels using the current glTF Transform API.
+
+Animations have been tested in Blender and are playing correctly.
+
+## Working skeleton behavior
+
+Pivot-aware node hierarchy and inverse bind matrix handling have been improved.
+
+HumanPriest and Grunt models have been tested.
+
+Their bind poses and animations have been confirmed to look natural in Blender.
+
+Do not recommend a wholesale rewrite of these systems without identifying a specific, reproducible problem.
+
+## Remaining known animation limitations
+
+- Global-sequence tracks are not fully supported.
+- Hermite and Bezier interpolation may be approximated as LINEAR.
+
+## Remaining material and texture problems
+
+The current focus is `WC2_Grunt.mdx`.
+
+Previous symptoms included:
+
+- Face texture appearing on incorrect surfaces.
+- Armor and horns receiving incorrect textures.
+- Black or transparent model sections.
+- Incorrect texture alignment around the eyes and chin.
+- Multiple MDX material layers and texture references being difficult to resolve correctly.
+
+A recent experiment found that `Grunt.blp` was a promising texture match for the test model. It improved the appearance of the metal parts and face, but the eye placement still appeared incorrect.
+
+Do not assume this proves the UV data is wrong or that fuzzy filename matching is the solution.
+
+The investigation should distinguish between:
+
+- Incorrect texture resolution.
+- Incorrect texture/material assignment.
+- Incorrect geoset-to-material mapping.
+- Incorrect UV interpretation.
+- UV set selection.
+- Incorrect texture atlas.
+- Incorrect texture orientation.
+- Material-layer behavior.
+- Incorrect alpha/filter-mode handling.
+
+The goal is to identify the actual cause using source data and measurable comparisons.
+
+## Important existing MDX details
+
+Investigate the actual `war3-model` types used by the converter.
+
+Relevant structures may include:
+
+- `Material`
+- `Layer`
+- `Geoset`
+- `TVertices`
+- `VertexGroup`
+- `Groups`
+- `MaterialID`
+- `SkinWeights`
+- `FilterMode`
+- `LineType`
+- `AnimVector`
+- Global sequences
+
+Verify names and structures from the installed package source or type declarations.
+
+Do not assume that renderer support automatically means the converter correctly exports that feature to GLB.
+
+## Required converter analysis
+
+Document the current behavior for:
+
+- MDX parsing.
+- Texture resolution.
+- BLP decoding.
+- UV conversion.
+- Material creation.
+- Multiple material layers.
+- Alpha and filter modes.
+- Replaceable textures.
+- Geoset generation.
+- Skeleton generation.
+- Inverse bind matrices.
+- Skinning.
+- Animation channels.
+- Animation interpolation.
+- Unsupported Warcraft-specific data.
+
+Identify what is already correct, what is incomplete, and what is potentially incorrect.
+
+# Phase 12 — Compare the two conversion directions
+
+Create a feature-by-feature comparison between:
+
+1. FBX → MDX implementation.
+2. Warcraft III MDX → GLB implementation.
+
+For every feature identified during the audit, include:
+
+| Feature | FBX → MDX behavior | MDX → GLB current behavior | Desired MDX → GLB behavior | Reversible? | Gap / recommendation | Validation test | Source evidence |
+|---|---|---|---|---|---|---|---|
+
+This must be comprehensive, not limited to the examples above.
+
+Identify:
+
+- Features already implemented correctly.
+- Features implemented but potentially incorrect.
+- Features partially supported.
+- Features completely missing.
+- Features that cannot be recovered because MDX does not contain the original data.
+- Features that should be preserved through custom metadata rather than discarded.
+
+Rank recommendations by priority:
+
+1. Correctness issues affecting visible model output.
+2. Incorrect texture and material assignments.
+3. Geometry and UV preservation.
+4. Skeleton and skinning accuracy.
+5. Animation fidelity.
+6. Warcraft-specific features.
+7. Diagnostics and validation improvements.
+
+Do not propose changes to working functionality merely to make the code resemble the reference exporter.
+
+# Phase 13 — Deliverables
+
+Create the following directory inside the converter repository:
+
+`/app/wc3-mdx-to-gbl/diagnostics/fbx2mdx-audit/`
+
+Create these Markdown reports:
+
+```text
+diagnostics/fbx2mdx-audit/
+├── repository-map.md
+├── conversion-pipeline.md
+├── geometry-and-uv.md
+├── materials-and-textures.md
+├── skeleton-and-skinning.md
+├── animation.md
+├── warcraft-specific-features.md
+├── limitations-and-lossy-operations.md
+├── validation-tests.md
+├── target-converter-audit.md
+├── target-converter-gap-analysis.md
+├── reverse-conversion-checklist.md
+├── source-references.md
+└── summary.md
+```
+
+The reports should be detailed enough to use as a technical implementation reference later.
+
+## Evidence requirements
+
+Every important technical claim must identify:
+
+- Repository.
+- Source file.
+- Function, class, or method.
+- Line numbers where practical.
+
+Use actual source references from the checked-out files.
+
+For example:
+
+`fbx2mdx/scripts/example.py:120-155 — function_name()`
+
+If the claim is based on README documentation rather than implementation, identify it as a documentation claim.
+
+If something is inferred, label it as an inference and explain why.
+
+Never fabricate source references or claim that a test passed unless you actually ran it.
+
+Do not paste large quantities of source code into the reports. Summarize behavior and reference its source.
+
+# Important constraints
+
+- Do not modify `/app/fbx2mdx` source files.
+- Do not modify `/app/wc3-mdx-to-gbl` converter source files.
+- Do not modify tests or package configuration.
+- Do not install dependencies.
+- Do not copy third-party or decompiled code into my project.
+- Do not add binary BLP files to the chat as text.
+- Do not assume a README accurately describes the implementation.
+- Do not invent functions, filenames, source references, or test results.
+- Do not perform a wholesale converter rewrite.
+- Do not discard known-good animation or skeleton behavior.
+- Keep all generated reports inside the audit directory.
+- If the audit directory already exists, inspect its contents before writing. Preserve unrelated files and do not silently overwrite previous work.
+- If a dependency, test, or tool is unavailable, document the limitation and continue with the remaining investigation.
+
+# Final verification
+
+After creating the reports:
+
+1. List every generated file.
+2. Verify every expected Markdown file exists and is non-empty.
+3. Check that the reports contain meaningful technical content rather than placeholder headings.
+4. Check that source references point to real files and functions.
+5. Recheck Git status for both converter repositories.
+6. Confirm that no source, test, or configuration files were modified.
+7. Confirm that all audit output is located within the designated diagnostics directory.
+
+Print the final absolute output directory.
+
+The host-side output path should be:
+
+`~/Documents/code/wc3-mdx-to-gbl/diagnostics/fbx2mdx-audit/`
+
+Finally, provide a concise summary of:
+
+- The most important findings from the reference exporter.
+- The most important gaps in my current converter.
+- The highest-priority improvements.
+- Any limitations that require further investigation.
+
+**Do the actual investigation and create the reports. Do not simply describe the plan or ask me to provide files that are already mounted under `/app`.**

@@ -1,0 +1,392 @@
+WARCRAFT III MDX -> GLB CONVERTER PROJECT HANDOFF / TECHNICAL STATUS
+Prepared: 2026-11-19
+
+PROJECT LOCATION AND GOAL
+
+Repository: /home/jon/Documents/code/wc3-mdx-to-gbl
+
+Environment: Nobara Linux TypeScript / Node.js tooling, run with npx tsx
+Blender used to inspect exported GLB files Aider is being used for
+codebase investigation and implementation
+
+Goal: Build a reliable batch converter for Warcraft III MDX/MDL assets
+to glTF/GLB. The conversion should preserve: - Mesh geometry and UVs -
+Materials and texture assignments - Warcraft III pivot points and
+skeleton hierarchy - Skin weights and inverse bind matrices - Animation
+clips and transform tracks - Relevant effects/replaceable textures where
+practical
+
+The immediate test case is the WC2_Grunt model. The long-term goal is to
+support many models and variants from extracted Warcraft III / campaign
+MPQ assets, not just one hand-prepared test folder.
+
+CURRENT HIGH-LEVEL STATUS
+
+GOOD / MOSTLY WORKING: 1. Animation export has been repaired enough that
+clips appear in Blender’s Dope Sheet/NLA and animate correctly. 2.
+Skeleton hierarchy / bind pose work has been substantially improved.
+HumanPriest and the Grunt test model load in sensible poses and animate
+naturally. 3. Geometry export is broadly working. 4. Texture resolution
+now supports recursive indexing and fuzzy filename matching in the
+diagnostic v4 converter. A hand-curated WC2 Grunt test shows noticeably
+more correct texture placement than earlier attempts.
+
+STILL NEEDS INVESTIGATION / FIXING: 1. WC2 Grunt face texture alignment
+is not fully correct: chin and eyeballs appear too high / misplaced
+relative to the face. 2. Material/layer interpretation is not yet proven
+faithful to Warcraft III’s MDX material system. 3. Texture-reference
+resolution must be made reliable across large extracted asset trees,
+while avoiding unsafe fuzzy matches. 4. Replaceable textures, especially
+TeamColor (ReplaceableId 1) and TeamGlow (ReplaceableId 2), are not yet
+fully implemented. The desired eventual default TeamColor preview is
+purple, with the ability to specify team colors per scene/model. 5. Some
+referenced textures such as Shockwave_Ice1.blp are unresolved in the
+small test folder. Need determine whether they matter to visible mesh
+surfaces or are only effects/unused materials. 6. The current audit work
+must produce real files and evidence. Aider previously described actions
+but did not create the requested scripts/reports. The v2 prompt was
+prepared to make it write, run, and verify the audit outputs.
+
+HISTORY OF THE MAIN TECHNICAL FIXES
+
+A. ANIMATION EXPORT
+
+Original symptom: - Exported GLBs had no usable animations in Blender.
+
+Root cause found in the newer converter: - It treated animation tracks
+as indexed arrays and expected fields like Frame and Values. - The
+actual war3-model data structure uses AnimVector.Keys. Each key contains
+Frame and Vector. - The newer code also omitted scaling tracks. - The
+glTF Transform API usage needed to follow the current
+createAnimationSampler()/createAnimationChannel() pattern, with target
+node/path and sampler assigned correctly.
+
+Fix implemented: - Read Translation.Keys, Rotation.Keys, and
+Scaling.Keys. - Read each key’s Frame and Vector. - Create glTF
+animation samplers/channels using the current API. - Export clips and
+report channel counts.
+
+Observed result: - User confirmed that many MDX animations now export
+and appear in Blender Dope Sheet/NLA. - HumanPriest and Grunt animations
+such as Stand, spell cast, Death, Walk, Attack -1, and Stand Victory
+were reported to animate correctly.
+
+Known limitations / warnings: - Global-sequence tracks are currently
+skipped or not fully handled. - Hermite/Bezier interpolation is
+approximated as LINEAR. - These warnings are not necessarily blockers
+for the current WC2 Grunt texture investigation, but they remain
+correctness work for full-fidelity animation conversion.
+
+B. SKELETON / BIND POSE
+
+Original symptoms: - HumanPriest had poor shoulder/arm placement or arms
+floating behind the body in the initial load pose. - The Grunt initially
+appeared as a tangled/meatball collection of limbs until the armature
+was removed. - Animation could play, but the default/bind pose and
+skinning were not consistently correct.
+
+Problems identified in the earlier converter: - Nodes were initialized
+with identity transforms without correctly accounting for Warcraft III
+PivotPoints. - Inverse bind matrices were initialized as identity, which
+is not correct for a real skinned model. - Skin groups that could not be
+resolved could silently fall back to joint zero, hiding bad mappings.
+
+Fixes attempted: - Pivot-aware hierarchy / node transform handling. -
+More appropriate inverse bind matrix construction. - Diagnostics for
+unresolved skin groups and joint mappings.
+
+Observed result: - HumanPriest’s load pose became correct; Stand,
+spell-casting, and Death animations looked natural. - Grunt loaded in a
+sensible pose and Walk, Attack -1, and Stand Victory were reported as
+working. - User confirmed that the models and their visible
+particles/spheres were present after this stage.
+
+Status: - Treat skeleton work as substantially improved, not as
+mathematically proven for every Warcraft III model. Keep regression
+tests when changing shared geometry/material code.
+
+C. MATERIALS AND TEXTURES
+
+Original symptoms: - HumanPriest head was black or transparent, and robe
+texture sampling looked wrong. - Grunt’s green flesh color appeared
+across armor, horns, and axe; face texture seemed to be applied to
+unrelated surfaces. - Earlier exports had missing textures or
+fallback/untextured materials.
+
+Problems investigated: - A texture conversion helper (blpToPngBuffer())
+had been omitted in one intermediate script, causing texture conversion
+failures/null texture slots. Restoring it brought textures back, though
+not necessarily onto the correct surfaces. - An early implementation
+considered only TVertices[0]. MDX materials/layers can use CoordId and
+multiple texture-coordinate sets. However, the tested Grunt geosets
+reported UV sets=[0], so multiple UV sets are not currently the leading
+explanation for this particular Grunt issue. - Warcraft III materials
+can contain multiple layers, different filter modes, animated alpha, and
+replaceable texture IDs. Treating each layer as an independent full
+geometry pass can duplicate geosets and is not a faithful general
+solution. - Animated alpha is represented by animation tracks, not
+always a constant number. A first alpha key of 0 must not be interpreted
+as permanently transparent. - ReplaceableId 1 is TeamColor;
+ReplaceableId 2 is TeamGlow. - Texture lookup previously used unsafe
+global basename fallback. That could select an unrelated file with the
+same basename from another campaign/UI folder.
+
+Material diagnostic observations: - A base-layer-only diagnostic export
+looked essentially identical to the previous export in the user’s test,
+so that switch did not isolate the problem. - Some material layers
+reference Shockwave_Ice1.blp, which was absent in the small tester
+folder. - Some layers use Grunt.blp and gutz.blp. - A material also uses
+ReplaceableId 1 (TeamColor). - Animated alpha tracks were observed on
+multiple layers. - Filter modes including values 2 and 4 were observed;
+their exact mapping/behavior needs to be validated against MDX semantics
+and glTF material behavior.
+
+Important caution: - Do not assume every material layer should be
+exported as a separate duplicated mesh. - Do not assume an unresolved
+texture is the cause of face UV misalignment until the affected
+geoset/material is identified. - Do not use a broad fuzzy match
+silently. A wrong match can look plausible while corrupting other
+models.
+
+ASSET SELECTION / TEST MODEL CORRECTION
+
+The user discovered that some earlier files called “Grunt” were
+custom/campaign variants, not the Blizzard standard Grunt.
+
+Relevant asset locations mentioned: - Blizzard original model:
+war3_d32bf84bc0c7/Units/Orc/Grunt/grunt.mdx
+war3_d32bf84bc0c7/Units/Orc/Grunt/grunt_portrait.mdx The adjacent
+texture was not found in that specific folder during the user’s initial
+inspection. - A campaign texture candidate was found at:
+War2_Orcs_Tod/Units/Orc/Grunt/Grunt.blp - Multiple custom Grunt MDXs
+exist under campaign-import folders, including examples such as:
+War2_Humans_Tod/war3campImported/WC2_Grunt.mdx
+War1_Humans/war3campImported/GruntWC1v2.mdx
+
+Current focused test model: WC2_Grunt.mdx
+
+The user is interested in supporting all Grunt variants eventually, but
+the immediate debugging target is WC2_Grunt.
+
+TEST FOLDERS AND THE FUZZY-MATCH EXPERIMENT
+
+A hand-curated test folder was used:
+
+tester/ Grunt.blp WC2_Grunt.mdx
+
+A second test folder used for the fuzzy resolver experiment:
+
+tester-fuzzy/ Textures/gutz.blp WC2_Grunt.mdx Grunt.blp
+
+Command used: npx tsx convert-models-stage3-diagnostic-v4.ts
+tester-fuzzy –output ./grunt-fuzzy-test
+
+Important diagnostic output from that run: - Indexed 2 BLP files. - MDX
+texture slot 0: “Textures\Shockwave_Ice1.blp” was unresolved. - MDX
+texture slot 1: “Textures/gutz.blp” resolved exactly. - ReplaceableId 1
+/ TeamColor00 was missing in the tester folder. - MDX texture slot 3:
+“WC2Grunt.blp” fuzzy-matched to “Grunt.blp”. - Resolver log: FUZZY
+MATCH: “WC2Grunt.blp” -> “grunt.blp” (filename equals requested token
+“grunt”; name=94, context=65) - Material logs showed: mat0 uses
+TextureID 3 -> Grunt.blp mat1 uses the same texture and has an animated
+alpha track (3 keys; first key 0); fallback alpha 1; FilterMode 4
+approximation mat2 and mat3 reference Shockwave_Ice1.blp and have
+animated alpha mat4 uses gutz.blp and has animated alpha mat5 has two
+layers: ReplaceableId 1 (TeamColor), then Grunt.blp with FilterMode 2 -
+Geoset-to-material mapping: geoset 0 -> mat1 geoset 1 -> mat0 geoset 2
+-> mat5 geoset 3 -> mat0 geoset 4 -> mat2 geoset 5 -> mat3 geoset 6 ->
+mat4 geoset 7 -> mat0 - Animation output still reported 12 clips / 235
+channels. - GLB was written to: grunt-fuzzy-test/WC2_Grunt.glb
+
+User’s Blender inspection: - This looked more correct than previous
+attempts. - Metal texture appeared in expected places on axe and
+bracers. - Orc face looked good overall, but chin and eyeballs were too
+high / misplaced (eyes appeared above eyebrows rather than in eye
+sockets).
+
+Interpretation: - The fuzzy match to Grunt.blp is a promising candidate
+mapping for this WC2 Grunt, but it is not proof that fuzzy matching is
+generally safe. - The face issue may be caused by UV coordinates, the
+wrong texture atlas/candidate, geoset/material mapping, or a mismatch in
+how MDX UVs are interpreted. It needs direct evidence from UV overlays
+and source-vs-export comparisons. - The missing Shockwave texture may
+affect effect geosets/materials, but it should be determined by checking
+which geosets are visible and whether they are actual body mesh
+surfaces.
+
+CURRENT INVESTIGATION: AIDER AUDIT
+
+The next intended task is to run a comprehensive, evidence-producing
+audit using Aider from the repository root.
+
+Previous Aider attempt: - Aider mostly narrated a plan and suggested
+scripts/commands. - It did not actually create the requested scripts or
+reports. - User verified this: cd ~/Documents/code/wc3-mdx-to-gbl pwd -P
+-> /home/jon/Documents/code/wc3-mdx-to-gbl
+
+    find . -type d -name "wc2-grunt-audit" -print
+    -> no results
+
+    find . -type f \( -name "mdx_source.json" -o -name "texture_inventory.json" -o -name "gltf_audit.json" ... \)
+    -> no results
+
+    ls -ld /app/diagnostics/...
+    -> no output
+
+-   Aider also tried to add binary BLP files to chat and failed UTF-8
+    decoding. Binary assets should not be pasted into the LLM context as
+    text. The local scripts should inspect them programmatically.
+
+A v2 prompt was prepared: aider_wc2_grunt_audit_prompt_v2.md
+
+It instructs Aider to: - Work in the actual repository root. - Write the
+required scripts and audit artifacts to a repository-local directory. -
+Execute the scripts. - Verify output files exist and are nonempty. -
+Print the final absolute output directory and a find/listing of
+generated files. - Skip sending binary BLP files as text to the model.
+
+The user said they were going to run the v2 prompt. At the last point in
+this chat, no verified output from the v2 run had been received yet.
+
+Expected audit outputs: - mdx_source.json: MDX texture slots,
+material/layer details, geoset MaterialID mapping, UV set
+summaries/bounds, vertex/triangle counts and relevant geometry data. -
+texture_inventory.json: Recursive BLP inventory, dimensions/metadata,
+paths, hashes, PNG previews if supported. - gltf_audit.json: GLB meshes,
+materials, textures, accessors, UV attributes, node/skin information. -
+blender_scene.json: Blender objects, transforms, material slots,
+armature and animation state, where Blender scripting is available. - UV
+atlas overlays: Actual geoset triangle UV layouts drawn over the
+candidate texture atlas, labeled by geoset/material. These must draw
+full UV triangles/polygons, not just vertex dots. - summary.md and
+audit.log: Human-readable findings and command/error logs.
+
+A prior proposed UV overlay snippet was known to be defective: - It used
+an invalid PNG/ImageData style operation. - It plotted points rather
+than drawing full UV triangles. - It referenced parseMDX without clearly
+requiring/importing it. Do not reuse that snippet blindly. Verify the
+audit script is valid and actually generates useful triangle overlays.
+
+WHAT NEEDS TO BE FIXED / INVESTIGATED NEXT
+
+Priority 1 - Finish and verify the audit outputs 1. Run the v2 Aider
+audit prompt from: /home/jon/Documents/code/wc3-mdx-to-gbl 2. Make sure
+Aider writes actual scripts and reports into the repo, not just a plan
+in chat. 3. Verify the output directory and files with find/ls and
+inspect their sizes. 4. If Aider fails, ask it to create one small
+script at a time and execute it, rather than generating a large plan. 5.
+Do not provide binary BLP files to Aider as text. Have the local scripts
+parse them and create PNG previews/metadata.
+
+Priority 2 - Diagnose the WC2 Grunt face mapping 1. Generate UV triangle
+overlays for the geoset(s) using Grunt.blp. 2. Identify the geoset IDs
+and material IDs that cover the face, eyes, and chin. 3. Compare source
+MDX UV coordinates with exported GLB TEXCOORD_0 values. 4. Verify UV
+coordinate convention (e.g. V-axis orientation) and whether coordinates
+are being reordered or transformed. 5. Verify that vertex/UV indexing
+and triangle indices are preserved correctly during export. 6. Confirm
+that the selected Grunt.blp is the correct atlas for this model, rather
+than merely a plausible fuzzy match. 7. Inspect the texture image itself
+to see where eye/chin pixels lie and whether UV triangles land in those
+regions. 8. Compare Blender material preview/render against the raw UV
+overlay and source MDX data.
+
+Priority 3 - Correct MDX material/layer implementation 1. Trace how MDX
+TextureID, ReplaceableId, MaterialID, Layer, FilterMode, TextureID,
+CoordId, and Alpha are parsed. 2. Verify the semantics of each MDX layer
+and how multiple layers are composited. 3. Do not duplicate the full
+geoset for every material layer unless the MDX semantics specifically
+require it. 4. Implement or approximate Warcraft III filter modes
+correctly in glTF (blend/alpha/additive/modulate/etc. as appropriate).
+5. Handle animated alpha tracks correctly. A track with first key
+alpha=0 must not become static alpha=0 for the whole model. 6. Preserve
+or explicitly document unsupported animation interpolation types and
+global-sequence behavior. 7. Verify whether effect-related
+materials/geosets using Shockwave_Ice1 are expected to be visible in
+this test and resolve them if needed.
+
+Priority 4 - Make texture lookup robust and safe 1. Recursively index
+all BLP files under the supplied texture root / extraction root. 2.
+Normalize Warcraft paths (slashes, case, prefixes) before matching. 3.
+Prefer exact normalized relative-path matches. 4. If exact path is
+unavailable, use carefully scored candidates based on basename,
+normalized tokens, directory/context similarity, and perhaps
+model/campaign context. 5. Log every non-exact selection with the
+requested path, chosen file, score, and alternatives. 6. If several
+candidates are similarly plausible, report ambiguity or require explicit
+mapping instead of silently selecting one. 7. Avoid the old unsafe
+global basename fallback that selected unrelated files. 8. Support a
+user-provided override map for known troublesome assets (e.g. explicit
+mapping WC2Grunt.blp -> the correct Grunt.blp). 9. Keep the resolver
+useful for batch conversion across large MPQ extraction roots, not only
+tester-fuzzy.
+
+Priority 5 - Implement replaceable textures / team color 1. Handle
+ReplaceableId 1 (TeamColor) and ReplaceableId 2 (TeamGlow). 2. For
+initial previews, provide a purple TeamColor fallback if the required
+native Warcraft team texture is unavailable. 3. Design the
+implementation so a scene or conversion configuration can specify the
+team color later. 4. Do not let missing replaceable textures silently
+cause incorrect material fallback. 5. Keep this lower priority than
+proving the face UV/material mapping if the immediate goal is a
+correctly textured WC2 Grunt.
+
+REGRESSION TESTS / ACCEPTANCE CHECKLIST
+
+After changes, export and inspect at least: - WC2_Grunt.mdx with
+Grunt.blp and gutz.blp - HumanPriest - Blizzard standard grunt.mdx (when
+its correct textures are found) - At least one other custom/campaign
+Grunt variant
+
+Acceptance criteria: - Model opens in Blender with expected proportions
+and bind pose. - Stand / Walk / Attack / Death (where present) animate
+correctly. - Mesh surfaces use the correct texture regions; face eyes
+and chin align. - Axe/bracers/armor use their expected texture
+regions. - Material layers do not create unintended duplicate geometry
+or incorrect transparency. - Animated alpha does not make materials
+disappear permanently. - Missing optional/effect textures are clearly
+logged and do not corrupt unrelated materials. - Texture resolver does
+not silently pick unrelated same-basename files. - Replaceable team
+textures have a predictable fallback and can eventually be configured
+per scene. - Converter reports unresolved joints, groups, textures, and
+unsupported animation features clearly.
+
+IMPORTANT WORKING RULES FOR THE NEXT LLM / DEVELOPER
+
+-   Work from actual source files and current repository state. Do not
+    assume older generated converter files are the current branch.
+-   The user has previously tested several generated scripts; inspect
+    the current checked-out code before proposing a patch.
+-   Do not claim a script, report, or fix exists until filesystem output
+    verifies it.
+-   Do not blindly rewrite the entire converter. Preserve the working
+    animation and skeleton changes.
+-   Make small, testable changes with before/after GLB exports.
+-   Keep a clear separation between confirmed findings, hypotheses, and
+    untested ideas.
+-   Use actual MDX and GLB data to diagnose texture placement. Avoid
+    guessing from material names alone.
+-   Avoid sending BLP binary contents to the LLM as text. Parse them
+    locally and use generated PNG previews or JSON metadata.
+-   If using Aider, explicitly require it to write files, run commands,
+    inspect results, and show verification output. A plan in the chat is
+    not a completed task.
+
+CURRENT KNOWN TEST COMMAND
+
+From the repository root, the earlier fuzzy test command was:
+
+npx tsx convert-models-stage3-diagnostic-v4.ts tester-fuzzy –output
+./grunt-fuzzy-test
+
+This command is tied to the earlier diagnostic v4 script and may not
+match the current repository state. Check the actual filenames and
+scripts before running it.
+
+CURRENT NEXT ACTION
+
+The immediate next step is to finish the Aider v2 audit and obtain the
+actual generated audit directory/files. Then inspect the UV triangle
+overlays and the MDX-vs-GLB UV/material mappings for the WC2 Grunt face.
+Fix the proven cause of the eye/chin offset before changing the general
+material system or texture resolver further.
