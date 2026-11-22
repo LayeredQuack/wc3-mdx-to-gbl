@@ -347,9 +347,8 @@ export function resolveTexture(
 
 /**
  * Resolve MDX replaceable texture slots to an extracted Warcraft III texture.
- * ReplaceableId 1 is TeamColor; ReplaceableId 2 is TeamGlow. The selected
- * index is a deliberate static preview choice (default 00/red), because the
- * runtime game normally chooses this from the owning player's color.
+ * The selected texture is a deliberate static preview choice because the
+ * runtime game normally chooses replacement textures from object data.
  */
 export function resolveReplaceableTexture(
   replaceableId: number,
@@ -358,17 +357,29 @@ export function resolveReplaceableTexture(
   mdxRelPath: string,
   warn: (message: string) => void
 ): string | null {
-  const kind = replaceableId === 1 ? 'TeamColor' : replaceableId === 2 ? 'TeamGlow' : null;
-  if (!kind) {
+  let canonicalPath: string | null = null;
+
+  if (replaceableId === 1 || replaceableId === 2) {
+    const kind = replaceableId === 1 ? 'TeamColor' : 'TeamGlow';
+    const suffix = `${kind}${String(teamColorIndex).padStart(2, '0')}.blp`;
+    canonicalPath = `ReplaceableTextures/${kind}/${suffix}`;
+  } else if (replaceableId === 34) {
+    // Northrend tree default texture for standalone previews.
+    canonicalPath = 'ReplaceableTextures/NorthrendTree/NorthTree.blp';
+  }
+
+  if (!canonicalPath) {
     warn(`unsupported ReplaceableId ${replaceableId}; no static replacement rule is defined`);
     return null;
   }
 
-  const suffix = `${kind}${String(teamColorIndex).padStart(2, '0')}.blp`;
-  const canonicalPath = `ReplaceableTextures/${kind}/${suffix}`;
   const resolved = resolveTexture(canonicalPath, index, mdxRelPath, warn);
+
   if (!resolved) {
-    warn(`ReplaceableId ${replaceableId} requires ${canonicalPath}, but that texture was not found in the extraction root`);
+    warn(
+      `ReplaceableId ${replaceableId} requires ${canonicalPath}, but that texture was not found in the extraction root`
+    );
   }
+
   return resolved;
 }
