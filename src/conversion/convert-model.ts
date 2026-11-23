@@ -12,7 +12,11 @@ import { parseMDX } from 'war3-model';
 import { Document, NodeIO } from '@gltf-transform/core';
 
 import type { TextureIndex } from '../types/conversion';
-import { resolveTexture, resolveReplaceableTexture } from '../textures/texture-index';
+import {
+  resolveTexture,
+  resolveReplaceableTexture,
+  getReplaceableTextureVariants,
+} from '../textures/texture-index';
 import { blpToPngBuffer } from '../textures/blp-decoder';
 import {
   readStaticNumeric,
@@ -23,6 +27,77 @@ import { buildSkeleton } from '../skeleton/skeleton-builder';
 import { buildGeosets } from '../geometry/geoset-builder';
 import { exportAnimations } from '../animation/animation-exporter';
 
+export interface ReplaceableVariantPlan {
+  selections: ReadonlyMap<number, string>;
+  suffix: string;
+}
+
+/**
+ * Build every combination of registered variants used by an MDX model.
+ *
+ * TeamColor (1) and TeamGlow (2) are deliberately excluded: their preview
+ * selection remains controlled by --team-color-index.
+ *
+ * Models without registered replaceable variants get one default plan.
+ */
+export function getReplaceableVariantPlans(
+  mdxAbsPath: string
+): ReplaceableVariantPlan[] {
+  const buf = fs.readFileSync(mdxAbsPath);
+  const model = parseMDX(
+    buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)
+  );
+
+  const replaceableIds = [
+    ...new Set(
+      (model.Textures || [])
+        .map((texture) => Number(texture?.ReplaceableId ?? 0))
+        .filter((id) => id > 0 && id !== 1 && id !== 2)
+    ),
+  ]
+    .filter((id) => getReplaceableTextureVariants(id).length > 0)
+    .sort((a, b) => a - b);
+
+  if (replaceableIds.length === 0) {
+    return [{ selections: new Map(), suffix: '' }];
+  }
+
+  // Build the Cartesian product of the registered variants for each ID.
+  let combinations: Map<number, string>[] = [new Map()];
+
+  for (const replaceableId of replaceableIds) {
+    const variants = getReplaceableTextureVariants(replaceableId);
+    const next: Map<number, string>[] = [];
+
+    for (const combination of combinations) {
+      for (const variant of variants) {
+        const selection = new Map(combination);
+        selection.set(replaceableId, variant.name);
+        next.push(selection);
+      }
+    }
+
+    combinations = next;
+  }
+
+  return combinations.map((selections) => {
+    const suffixParts = replaceableIds.map((replaceableId) => {
+      const variantName = selections.get(replaceableId)!;
+
+      // Keep the simple, requested suffixes for single-ID models.
+      // Include IDs when multiple replaceable types are combined.
+      return replaceableIds.length === 1
+        ? variantName
+        : `R${replaceableId}_${variantName}`;
+    });
+
+    return {
+      selections,
+      suffix: `_${suffixParts.join('_')}`,
+    };
+  });
+}
+
 export async function convertOne(
   mdxAbsPath: string,
   relPath: string,
@@ -30,7 +105,9 @@ export async function convertOne(
   outDir: string,
   materialLayerMode: 'stack' | 'base',
   teamColorIndex: number,
-  allowFuzzyTextureFallback: boolean
+  allowFuzzyTextureFallback: boolean,
+  replaceableVariants: ReadonlyMap<number, string> = new Map(),
+  outputSuffix = ''
 ): Promise<string> {
   const buf = fs.readFileSync(mdxAbsPath);
   const model = parseMDX(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
@@ -59,9 +136,17 @@ export async function convertOne(
     // the extracted team-color/team-glow variants for this static preview.
     if (!resolved && replaceableId > 0) {
       resolved = resolveReplaceableTexture(
-        replaceableId, teamColorIndex, textureIndex, relPath, warnTexture
+        replaceableId,
+        teamColorIndex,
+        textureIndex,
+        relPath,
+        warnTexture,
+        replaceableVariants.get(replaceableId)
       );
-      resolutionKind = `ReplaceableId ${replaceableId} (preview index ${teamColorIndex})`;
+      resolutionKind = `ReplaceableId ${replaceableId}` +
+        (replaceableVariants.has(replaceableId)
+          ? ` (${replaceableVariants.get(replaceableId)})`
+          : ` (preview index ${teamColorIndex})`);
     }
 
     if (!resolved) {
@@ -195,7 +280,7 @@ export async function convertOne(
   doc.getRoot().setDefaultScene(scene);
 
   // Output GLB
-  const outRel = relPath.replace(/\.mdx$/i, '.glb');
+  const outRel = relPath.replace(/\.mdx$/i, `${outputSuffix}.glb`);
   const outAbs = path.join(outDir, outRel);
   fs.mkdirSync(path.dirname(outAbs), { recursive: true });
 

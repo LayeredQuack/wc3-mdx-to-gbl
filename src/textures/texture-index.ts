@@ -345,39 +345,125 @@ export function resolveTexture(
   return null;
 }
 
+
+export interface ReplaceableTextureVariant {
+  name: string;
+  canonicalPath: string;
+}
+
+/**
+ * Known static texture choices for Warcraft III replaceable texture slots.
+ *
+ * The first entry is the default preview texture when variant expansion
+ * is disabled. These are static preview choices; Warcraft normally selects
+ * replacement textures at runtime from object data.
+ */
+const REPLACEABLE_TEXTURE_VARIANTS: Record<number, readonly ReplaceableTextureVariant[]> = {
+  31: [
+    {
+      name: 'Summer',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronSummerTree.blp',
+    },
+    {
+      name: 'Summer_Blight',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronSummerTreeBlight.blp',
+    },
+    {
+      name: 'Winter',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronWinterTree.blp',
+    },
+    {
+      name: 'Winter_Blight',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronWinterTreeBlight.blp',
+    },
+    {
+      name: 'Fall',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronFallTree.blp',
+    },
+    {
+      name: 'Fall_Blight',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronFallTreeBlight.blp',
+    },
+    {
+      name: 'Snow',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronSnowTree.blp',
+    },
+    {
+      name: 'Snow_Blight',
+      canonicalPath: 'ReplaceableTextures/LordaeronTree/LordaeronSnowTreeBlight.blp',
+    },
+  ],
+  34: [
+    {
+      name: 'Normal',
+      canonicalPath: 'ReplaceableTextures/NorthrendTree/NorthTree.blp',
+    },
+    {
+      name: 'Blight',
+      canonicalPath: 'ReplaceableTextures/NorthrendTree/NorthTreeBlight.blp',
+    },
+  ],
+};
+
+/**
+ * Returns the known static preview variants for a replaceable texture ID.
+ * The first returned variant is the default.
+ */
+export function getReplaceableTextureVariants(
+  replaceableId: number
+): readonly ReplaceableTextureVariant[] {
+  return REPLACEABLE_TEXTURE_VARIANTS[replaceableId] ?? [];
+}
+
 /**
  * Resolve MDX replaceable texture slots to an extracted Warcraft III texture.
- * The selected texture is a deliberate static preview choice because the
- * runtime game normally chooses replacement textures from object data.
+ *
+ * When variantName is omitted, the first registered variant is selected.
  */
 export function resolveReplaceableTexture(
   replaceableId: number,
   teamColorIndex: number,
   index: TextureIndex,
   mdxRelPath: string,
-  warn: (message: string) => void
+  warn: (message: string) => void,
+  variantName?: string
 ): string | null {
   let canonicalPath: string | null = null;
 
+  // TeamColor and TeamGlow retain their existing player-index behavior.
   if (replaceableId === 1 || replaceableId === 2) {
     const kind = replaceableId === 1 ? 'TeamColor' : 'TeamGlow';
     const suffix = `${kind}${String(teamColorIndex).padStart(2, '0')}.blp`;
     canonicalPath = `ReplaceableTextures/${kind}/${suffix}`;
-  } else if (replaceableId === 34) {
-    // Northrend tree default texture for standalone previews.
-    canonicalPath = 'ReplaceableTextures/NorthrendTree/NorthTree.blp';
-  }
+  } else {
+    const variants = getReplaceableTextureVariants(replaceableId);
 
-  if (!canonicalPath) {
-    warn(`unsupported ReplaceableId ${replaceableId}; no static replacement rule is defined`);
-    return null;
+    if (variants.length === 0) {
+      warn(`unsupported ReplaceableId ${replaceableId}; no static replacement rule is defined`);
+      return null;
+    }
+
+    const selected = variantName
+      ? variants.find((variant) => variant.name === variantName)
+      : variants[0];
+
+    if (!selected) {
+      warn(
+        `unknown variant "${variantName}" for ReplaceableId ${replaceableId}; ` +
+        `available variants: ${variants.map((variant) => variant.name).join(', ')}`
+      );
+      return null;
+    }
+
+    canonicalPath = selected.canonicalPath;
   }
 
   const resolved = resolveTexture(canonicalPath, index, mdxRelPath, warn);
 
   if (!resolved) {
     warn(
-      `ReplaceableId ${replaceableId} requires ${canonicalPath}, but that texture was not found in the extraction root`
+      `ReplaceableId ${replaceableId} requires ${canonicalPath}, ` +
+      `but that texture was not found in the extraction root`
     );
   }
 
